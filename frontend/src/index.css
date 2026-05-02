@@ -1,0 +1,144 @@
+@import "tailwindcss";
+
+@theme {
+  --color-brand: #0066FF;
+  --color-brand-hover: #0052CC;
+  --color-brand-light: color-mix(in srgb, #0066FF 8%, transparent);
+  --color-success: #22C55E;
+  --color-warning: #F59E0B;
+  --color-error: #EF4444;
+
+  --font-sans: 'Inter', system-ui, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+}
+
+@layer base {
+  body {
+    @apply bg-[#FAFAFA] text-[#525252] antialiased;
+    font-family: var(--font-sans);
+    font-size: 15px;
+    line-height: 1.6;
+  }
+
+  * {
+    @apply border-[#E5E5E5];
+  }
+}
+
+@keyframes shimmer {
+  0%   { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+@keyframes dot-pulse {
+  0%, 100% { opacity: 0.4; }
+  50%      { opacity: 1; }
+}
+
+.bg-app-pattern {
+  background-color: #FAFAFA;
+  background-image:
+    radial-gradient(ellipse 80% 50% at 50% -10%, rgba(59, 130, 246, 0.05) 0%, transparent 70%),
+    radial-gradient(ellipse 60% 40% at 80% 90%, rgba(99, 102, 241, 0.04) 0%, transparent 60%),
+    radial-gradient(rgba(0, 102, 255, 0.035) 1px, transparent 1px);
+  background-size: 100% 100%, 100% 100%, 24px 24px;
+}
+
+.progress-fill-shimmer {
+  background: linear-gradient(
+    90deg,
+    var(--color-brand) 0%,
+    color-mix(in srgb, var(--color-brand) 78%, white) 25%,
+    var(--color-brand) 50%,
+    color-mix(in srgb, var(--color-brand) 78%, white) 75%,
+    var(--color-brand) 100%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 2s ease-in-out infinite;
+}
+
+.chat-window::-webkit-scrollbar { width: 5px; }
+.chat-window::-webkit-scrollbar-thumb { background: #E5E5E5; border-radius: 4px; }
+
+.message-text {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  max-width: 100%;
+}
+.message-text h1, .message-text h2, .message-text h3 {
+  font-size: 15px;
+  font-weight: 600;
+  margin: 6px 0 4px;
+  color: #262626;
+}
+.message-text hr { border: none; border-top: 1px solid #E5E5E5; margin: 8px 0; }
+.message-text blockquote {
+  border-left: 2px solid #0066FF;
+  padding-left: 10px;
+  color: #737373;
+  margin: 6px 0;
+}
+.message-text ul, .message-text ol { padding-left: 20px; margin: 4px 0; }
+.message-text li { margin-bottom: 2px; }
+.message-text code {
+  background: #F5F5F5;
+  padding: 1px 4px;
+  border-radius: 4px;
+  font-size: 13px;
+  font-family: var(--font-mono);
+}
+.message-text pre {
+  background: #F5F5F5;
+  padding: 8px 10px;
+  border-radius: 6px;
+  overflow-x: auto;
+  font-size: 13px;
+  margin: 6px 0;
+}
+.message-text pre code {
+  background: none;
+  padding: 0;
+}
+.message-text strong { font-weight: 600; color: #262626; }
+.message-text img {
+  max-width: 100%;
+  height: auto;
+}
+.message-text .table-wrap {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  margin: 10px 0;
+  filter: drop-shadow(0 1px 2px rgba(0,0,0,0.04));
+}
+.message-text table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 13px;
+  border-radius: 10px;
+  overflow: hidden;
+  box-shadow: 0 0 0 1px #E5E5E5;
+  min-width: 300px;
+}
+.message-text thead { background: #F5F5F5; }
+.message-text thead th {
+  padding: 9px 14px;
+  text-align: left;
+  font-weight: 600;
+  color: #262626;
+  border-bottom: 2px solid #E5E5E5;
+  font-size: 12px;
+}
+.message-text tbody td {
+  padding: 8px 14px;
+  border-bottom: 1px solid rgba(0,0,0,0.04);
+  vertical-align: top;
+}
+.message-text tbody tr:last-child td { border-bottom: none; }
+.message-text tbody tr:nth-child(even) { background: rgba(0,0,0,0.012); }
+.message-text tbody tr {
+  transition: background-color 0.15s ease;
+}
+.message-text tbody tr:hover { background: #0066FF08; }
+.message-text td:first-child, .message-text th:first-child { padding-left: 16px; }
+.message-text td:last-child, .message-text th:last-child { padding-right: 16px; }

@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+.claude/
+merged_output/
+uploads/
+*.egg-info/
+*.docx
+*.log
+_extracted.json
+_structure.txt
