@@ -208,12 +208,9 @@ class MergeAgent:
             "content": (
                 f"{context}\n\n"
                 f"【用户消息】\n{user_message}\n\n"
-                "(如果用户表达了合并文档的意图，请按以下顺序操作：\n"
-                "1. 先调用 get_session_info 确认文档情况\n"
-                "2. 如果文档不足2个，直接告知用户\n"
-                "3. 调用 parse_documents 解析\n"
-                "4. 调用 analyze_commonality 分析\n"
-                "5. 调用 generate_merged_document 生成\n"
+                "(请根据用户意图和当前状态，自主选择合适的工具来完成任务。"
+                "文档合并的核心步骤包括：解析文档、分析共性与独有内容、生成合并文档。"
+                "但不是每次都必须执行全部步骤——根据实际情况灵活判断。"
                 "如果用户只是闲聊或询问，请直接回复，不要调用工具。)"
             ),
         })
@@ -245,7 +242,7 @@ class MergeAgent:
                 try:
                     async with client.messages.stream(
                         model=MODEL,
-                        max_tokens=4096,
+                        max_tokens=8192,
                         system=SYSTEM_PROMPT,
                         messages=messages,
                         tools=TOOLS,
@@ -571,11 +568,18 @@ class MergeAgent:
                             "reason": data.get("reason", ""),
                         })
                     elif event_type == "step_done":
+                        completed_groups = data.get("current", completed_groups + 1)
+                        pct = 30 + int(30 * completed_groups / max(total_groups, 1))
                         emit("analysis_step", {
                             "heading": data.get("heading", ""),
-                            "current": data.get("current", completed_groups),
+                            "current": completed_groups,
                             "total": data.get("total", total_groups),
                             "status": "done",
+                        })
+                        emit("progress", {
+                            "stage": "analyzing",
+                            "message": f"AI语义分析 ({completed_groups}/{total_groups}): {data.get('heading', '')}",
+                            "percent": pct,
                         })
                     elif event_type == "step_error":
                         emit("analysis_step", {
@@ -791,13 +795,81 @@ class MergeAgent:
         )
         yield self._sse("message", {"text": f"✅ 解析完成：\n\n{docs_info}\n\n正在AI语义分析..."})
 
-        yield self._sse("progress", {
-            "stage": "analyzing", "message": "AI语义分析中...", "percent": 30,
-        })
+        aq: asyncio.Queue = asyncio.Queue()
+
+        def on_progress(event_type: str, data: dict):
+            try:
+                aq.put_nowait((event_type, data))
+            except Exception:
+                pass
 
         docs_data = [d.to_dict() for d in parsed_docs]
         loop = asyncio.get_event_loop()
-        merge_plan = await loop.run_in_executor(None, analyze_documents, docs_data)
+
+        async def run_analysis():
+            return await loop.run_in_executor(
+                None, analyze_documents, docs_data, on_progress,
+            )
+
+        analysis_task = asyncio.ensure_future(run_analysis())
+
+        total_groups = 0
+        completed_groups = 0
+        while not analysis_task.done():
+            try:
+                event_type, data = await asyncio.wait_for(aq.get(), timeout=0.1)
+                if event_type == "step_start":
+                    completed_groups = data.get("current", 0)
+                    total_groups = data.get("total", 0)
+                    pct = 30 + int(30 * completed_groups / max(total_groups, 1))
+                    yield self._sse("analysis_step", {
+                        "heading": data.get("heading", ""),
+                        "current": completed_groups,
+                        "total": total_groups,
+                        "status": "running",
+                    })
+                    yield self._sse("progress", {
+                        "stage": "analyzing",
+                        "message": f"AI语义分析 ({completed_groups}/{total_groups}): {data.get('heading', '')}",
+                        "percent": pct,
+                    })
+                elif event_type == "thinking":
+                    yield self._sse("thinking", {
+                        "heading": data.get("heading", ""),
+                        "thought": data.get("thought", ""),
+                    })
+                elif event_type == "retry":
+                    yield self._sse("retry", {
+                        "heading": data.get("heading", ""),
+                        "attempt": data.get("attempt", 0),
+                        "reason": data.get("reason", ""),
+                    })
+                elif event_type == "step_done":
+                    completed_groups = data.get("current", completed_groups + 1)
+                    pct = 30 + int(30 * completed_groups / max(total_groups, 1))
+                    yield self._sse("analysis_step", {
+                        "heading": data.get("heading", ""),
+                        "current": completed_groups,
+                        "total": data.get("total", total_groups),
+                        "status": "done",
+                    })
+                    yield self._sse("progress", {
+                        "stage": "analyzing",
+                        "message": f"AI语义分析 ({completed_groups}/{total_groups}): {data.get('heading', '')}",
+                        "percent": pct,
+                    })
+                elif event_type == "step_error":
+                    yield self._sse("analysis_step", {
+                        "heading": data.get("heading", ""),
+                        "current": completed_groups,
+                        "total": total_groups,
+                        "status": "error",
+                        "error": data.get("error", ""),
+                    })
+            except asyncio.TimeoutError:
+                pass
+
+        merge_plan = await analysis_task
         session["merge_plan"] = merge_plan
 
         yield self._sse("progress", {

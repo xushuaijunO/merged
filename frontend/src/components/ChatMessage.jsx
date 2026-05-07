@@ -57,21 +57,22 @@ function AnalysisPanel({ analysis }) {
     setExpandedThoughts(prev => ({ ...prev, [heading]: !prev[heading] }))
   }
 
-  const counter = analysis.completedGroups || analysis.steps.filter(s => s.status === 'done').length
+  const doneCount = analysis.steps.filter(s => s.status === 'done').length
+  const totalCount = analysis.totalGroups || analysis.steps.length
   const errorCount = analysis.steps.filter(s => s.status === 'error').length
 
   return (
-    <Collapsible defaultOpen className="mt-3 border-l-2 border-l-brand" open={panelOpen} onOpenChange={setPanelOpen}>
+    <Collapsible defaultOpen className="mt-3 border-l-2 border-l-brand overflow-hidden" open={panelOpen} onOpenChange={setPanelOpen}>
       <CollapsibleTrigger className="flex items-center gap-2.5 px-3 py-2.5 hover:bg-gray-50">
         {allDone ? (
           <CheckCircle2 className="w-4 h-4 text-emerald-500 flex-shrink-0" strokeWidth={2} />
         ) : (
           <Brain className="w-4 h-4 text-brand flex-shrink-0" strokeWidth={1.5} />
         )}
-        <span className="text-[13px] font-semibold text-gray-800 flex-1">
+        <span className="text-[13px] font-semibold text-gray-800 flex-1 min-w-0 truncate">
           {allDone
-            ? `AI 语义分析完成 (${counter}/${analysis.totalGroups || analysis.steps.length})`
-            : `AI 语义分析 (${counter}/${analysis.totalGroups || analysis.steps.length})`
+            ? `AI 语义分析完成 (${doneCount}/${totalCount})`
+            : `AI 语义分析 (${doneCount}/${totalCount})`
           }
         </span>
         <div className="flex gap-1.5">
@@ -92,7 +93,7 @@ function AnalysisPanel({ analysis }) {
                 {step.status === 'error' && <XCircle className="w-3.5 h-3.5 text-red-500 flex-shrink-0" strokeWidth={2} />}
                 {!step.status && <Circle className="w-3.5 h-3.5 text-gray-300 flex-shrink-0" strokeWidth={1.5} />}
 
-                <span className="text-[12px] text-gray-700 flex-1 truncate" title={step.heading}>
+                <span className="text-[12px] text-gray-700 flex-1 min-w-0 truncate" title={step.heading}>
                   {step.heading.split(' > ').pop() || step.heading}
                 </span>
 
@@ -153,8 +154,8 @@ export default function ChatMessage({ msg, onRemoveFile }) {
       className={`flex gap-2 ${isUser ? 'justify-end' : 'justify-start'} ${isUser ? 'ml-auto max-w-[75%]' : 'mr-auto max-w-[85%]'}`}
     >
       <div className={isUser
-        ? "bg-brand text-white rounded-2xl rounded-br-md px-4 py-2.5 text-[14px] leading-relaxed shadow-sm"
-        : "bg-gray-100 text-gray-600 rounded-2xl rounded-bl-md px-4 py-2.5 text-[14px] leading-relaxed"
+        ? "bg-brand text-white rounded-2xl rounded-br-md px-4 py-2.5 text-[14px] leading-relaxed shadow-sm min-w-0 overflow-hidden"
+        : "bg-gray-100 text-gray-600 rounded-2xl rounded-bl-md px-4 py-2.5 text-[14px] leading-relaxed min-w-0 overflow-hidden"
       }>
         {msg.files && msg.files.length > 0 && (
           <div className="flex flex-col gap-2 mb-2">
@@ -239,8 +240,8 @@ export default function ChatMessage({ msg, onRemoveFile }) {
                 style={{ width: `${Math.min(msg.progress.percent || 0, 100)}%` }}
               />
             </div>
-            <div className="flex items-center gap-2 mt-1">
-              <span className="text-[11px] text-gray-400">{msg.progress.message}</span>
+            <div className="flex items-center gap-2 mt-1 min-w-0">
+              <span className="text-[11px] text-gray-400 truncate">{msg.progress.message}</span>
               {msg.progress.stage && (
                 <Badge variant="default">{msg.progress.stage.toUpperCase()}</Badge>
               )}

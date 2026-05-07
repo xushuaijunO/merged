@@ -6,6 +6,8 @@ Streaming-aware with progress callbacks for real-time UI updates.
 import json
 import re
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Callable
 from collections import defaultdict
@@ -118,11 +120,17 @@ def _build_analysis_prompt(heading_path: str, entries: List[dict]) -> str:
 
     combined = "\n\n---\n\n".join(docs_content)
 
+    doc_names = [e['doc_name'] for e in entries]
+    doc_names_str = "、".join(doc_names)
+    doc_keys_example = ",\n    ".join(f'"{n}": ["独有内容要点"]' for n in doc_names)
+
     return f"""你是一个专业的文档合并专家。以下是 {len(entries)} 个文档中同一章节「{heading_path}」的内容。
+
+参与分析的文档：{doc_names_str}
 
 请分析这些内容：
 1. **共性内容**：语义相同或高度相似的部分，请融合为一段统一、通顺的表述
-2. **独有内容**：每个文档各自独有的内容，标注来源文档名
+2. **独有内容**：每个文档各自独有的内容。**关键：unique_by_doc 的 key 必须使用上面列出的文档名，不得使用"文档1""文档2"等代称。**
 3. **图片处理**：
    - 如果多个图片的 dHash 前12位相同 → 它们是同一张图，只需保留一份
    - 在 `image_placement` 中指定每张图片应插入到共性内容或独有内容的哪句话后面
@@ -133,18 +141,18 @@ def _build_analysis_prompt(heading_path: str, entries: List[dict]) -> str:
 - 相似的表述应合并，不要简单拼接
 - 独有内容保持原文不变
 - 如果某文档该章节为空或仅有标题，标记为"无实质内容"
+- unique_by_doc 中无独有内容的文档也要列出，值设为空数组 []
 
 请严格按以下JSON格式输出（不要输出其他内容）：
 {{
   "common": "融合后的共性内容",
   "unique_by_doc": {{
-    "文档1": ["独有内容要点1"],
-    "文档2": []
+    {doc_keys_example}
   }},
   "image_placement": [
     {{
       "anchor_text": "要插入到哪句话后面（原文片段，20字以内）",
-      "target": "common 或 文档名",
+      "target": "common 或 文档名（使用上面的实际文档名）",
       "dhash": "图片的dHash值",
       "caption": "图片标题（10字以内）",
       "duplicate_of": null
@@ -205,7 +213,7 @@ def _call_claude_streaming(heading_path: str, entries: List[dict], progress_call
     try:
         with client.messages.stream(
             model=MODEL,
-            max_tokens=4096,
+            max_tokens=8192,
             system="你是一个专业的文档合并与编辑助手。你的输出必须是合法的JSON格式。",
             messages=[{"role": "user", "content": prompt}],
         ) as stream:
@@ -357,9 +365,58 @@ def structural_only_analysis(groups: Dict[str, List[dict]],
     return plan
 
 
+def _process_ai_result(heading_path: str, entries: List[dict], result: dict,
+                       plan: MergePlan):
+    """Process a single AI analysis result and populate the merge plan."""
+    common_text = result.get("common", "")
+    image_placement = result.get("image_placement", [])
+
+    if common_text and common_text != "无":
+        all_section_images = []
+        for e in entries:
+            all_section_images.extend(e.get("images", []))
+        deduped_images = _dedup_images_by_hash(all_section_images)
+        plan.common_sections.append({
+            "heading": heading_path.split(" > ")[-1],
+            "full_path": heading_path,
+            "level": entries[0]["level"],
+            "paragraphs": [common_text],
+            "tables": entries[0].get("tables", []),
+            "image_count": len(deduped_images),
+            "images": deduped_images,
+            "image_placement": image_placement,
+        })
+
+    unique_by_doc = result.get("unique_by_doc", {})
+    # Build a mapping from generic "文档N" keys to actual doc names
+    unique_docs = list(dict.fromkeys(e["doc_name"] for e in entries))
+    generic_to_real = {f"文档{i+1}": name for i, name in enumerate(unique_docs)}
+
+    for doc_name, items in unique_by_doc.items():
+        if items and len(items) > 0:
+            # Map generic AI-generated key to actual filename
+            actual_name = generic_to_real.get(doc_name, doc_name)
+            entry_images = []
+            for e in entries:
+                if e["doc_name"] == actual_name:
+                    entry_images = e.get("images", [])
+                    break
+            plan.doc_specific[actual_name].append({
+                "heading": f"{heading_path.split(' > ')[-1]}（独有）",
+                "level": entries[0]["level"] + 1,
+                "paragraphs": items if isinstance(items[0], str) else [str(i) for i in items],
+                "tables": [],
+                "image_count": len(entry_images),
+                "images": entry_images,
+            })
+
+
 def ai_analysis(groups: Dict[str, List[dict]],
                 progress_callback: Optional[Callable] = None) -> MergePlan:
-    """Full AI-powered analysis using Claude API with progress reporting.
+    """Full AI-powered analysis using Claude API with concurrent execution.
+
+    Single-doc groups are processed immediately (no AI needed).
+    Multi-doc groups are submitted to a thread pool for parallel AI analysis.
 
     Args:
         groups: Heading groups keyed by path
@@ -368,18 +425,13 @@ def ai_analysis(groups: Dict[str, List[dict]],
     plan = MergePlan()
     total = len(groups)
     completed = 0
+    lock = threading.Lock()
 
+    # Phase 1: process single-doc groups immediately, collect AI tasks
+    ai_tasks = []
     for heading_path, entries in groups.items():
         docs_in_group = {e["doc_name"] for e in entries}
-        completed += 1
-
-        if progress_callback:
-            progress_callback("step_start", {
-                "heading": heading_path, "current": completed, "total": total,
-            })
-
         if len(docs_in_group) == 1:
-            # Only in one document → automatically doc-specific
             e = entries[0]
             if e["paragraphs"] or e["tables"] or e.get("images"):
                 plan.doc_specific[e["doc_name"]].append({
@@ -390,75 +442,58 @@ def ai_analysis(groups: Dict[str, List[dict]],
                     "image_count": e.get("image_count", 0),
                     "images": e.get("images", []),
                 })
+            with lock:
+                completed += 1
             if progress_callback:
                 progress_callback("step_done", {
                     "heading": heading_path, "current": completed, "total": total,
                 })
         else:
-            # Multiple documents share this heading → AI analysis
+            ai_tasks.append((heading_path, entries))
+
+    # Phase 2: concurrent AI analysis for multi-doc groups
+    if ai_tasks:
+        # Signal all AI step starts at once
+        for heading_path, _entries in ai_tasks:
+            if progress_callback:
+                progress_callback("step_start", {
+                    "heading": heading_path, "current": completed, "total": total,
+                })
+
+        def analyze_one(hp, ents):
             try:
-                result = analyze_with_claude(heading_path, entries, progress_callback)
+                result = analyze_with_claude(hp, ents, progress_callback)
+                return hp, ents, result, None
+            except Exception as exc:
+                logger.error("AI analysis fatal error for '%s': %s", hp, str(exc))
+                return hp, ents, None, str(exc)
 
-                # Common content
-                common_text = result.get("common", "")
-                image_placement = result.get("image_placement", [])
-                if common_text and common_text != "无":
-                    # Collect all images from all entries
-                    all_section_images = []
-                    for e in entries:
-                        all_section_images.extend(e.get("images", []))
-                    from doc_parser import hamming_distance
-                    deduped_images = _dedup_images_by_hash(all_section_images)
-
-                    plan.common_sections.append({
-                        "heading": heading_path.split(" > ")[-1],
-                        "full_path": heading_path,
-                        "level": entries[0]["level"],
-                        "paragraphs": [common_text],
-                        "tables": entries[0].get("tables", []),
-                        "image_count": len(deduped_images),
-                        "images": deduped_images,
-                        "image_placement": image_placement,
-                    })
-
-                # Unique content per document
-                unique_by_doc = result.get("unique_by_doc", {})
-                for doc_name, items in unique_by_doc.items():
-                    if items and len(items) > 0:
-                        # Find matching entry images
-                        entry_images = []
-                        for e in entries:
-                            if e["doc_name"] == doc_name:
-                                entry_images = e.get("images", [])
-                                break
-                        plan.doc_specific[doc_name].append({
-                            "heading": f"{heading_path.split(' > ')[-1]}（独有）",
-                            "level": entries[0]["level"] + 1,
-                            "paragraphs": items if isinstance(items[0], str) else [str(i) for i in items],
-                            "tables": [],
-                            "image_count": len(entry_images),
-                            "images": entry_images,
+        max_workers = min(5, len(ai_tasks))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(analyze_one, hp, e): hp for hp, e in ai_tasks}
+            for future in as_completed(futures):
+                hp, ents, result, error = future.result()
+                with lock:
+                    completed += 1
+                if error:
+                    if progress_callback:
+                        progress_callback("step_error", {
+                            "heading": hp, "error": error[:100],
                         })
-
+                    for entry in ents:
+                        plan.doc_specific[entry["doc_name"]].append({
+                            "heading": hp.split(" > ")[-1],
+                            "level": entry["level"],
+                            "paragraphs": entry["paragraphs"],
+                            "tables": entry.get("tables", []),
+                            "image_count": entry.get("image_count", 0),
+                            "images": entry.get("images", []),
+                        })
+                else:
+                    _process_ai_result(hp, ents, result, plan)
                 if progress_callback:
                     progress_callback("step_done", {
-                        "heading": heading_path, "current": completed, "total": total,
-                    })
-
-            except Exception as e:
-                logger.error("AI analysis fatal error for '%s': %s", heading_path, str(e))
-                if progress_callback:
-                    progress_callback("step_error", {
-                        "heading": heading_path, "error": str(e)[:100],
-                    })
-                for entry in entries:
-                    plan.doc_specific[entry["doc_name"]].append({
-                        "heading": heading_path.split(" > ")[-1],
-                        "level": entry["level"],
-                        "paragraphs": entry["paragraphs"],
-                        "tables": entry.get("tables", []),
-                        "image_count": entry.get("image_count", 0),
-                        "images": entry.get("images", []),
+                        "heading": hp, "current": completed, "total": total,
                     })
 
     plan.summary = {

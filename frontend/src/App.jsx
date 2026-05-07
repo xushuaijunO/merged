@@ -142,9 +142,8 @@ export default function App() {
                     const copy = [...prev]
                     const last = copy[copy.length - 1]
                     if (last && last.role === 'agent' && last._streaming) {
-                      if (!last.analysis) last.analysis = { steps: [], totalGroups: 0, completedGroups: 0 }
+                      if (!last.analysis) last.analysis = { steps: [], totalGroups: 0 }
                       last.analysis.totalGroups = data.total || 0
-                      last.analysis.completedGroups = data.status === 'done' ? (last.analysis.completedGroups + 1) : (data.current || 0)
                       const existingIdx = last.analysis.steps.findIndex(s => s.heading === data.heading)
                       const step = { heading: data.heading, status: data.status, error: data.error || '', thoughts: [] }
                       if (existingIdx >= 0) { step.thoughts = last.analysis.steps[existingIdx].thoughts; last.analysis.steps[existingIdx] = step }
@@ -159,7 +158,7 @@ export default function App() {
                     const copy = [...prev]
                     const last = copy[copy.length - 1]
                     if (last && last.role === 'agent' && last._streaming) {
-                      if (!last.analysis) last.analysis = { steps: [], totalGroups: 0, completedGroups: 0 }
+                      if (!last.analysis) last.analysis = { steps: [], totalGroups: 0 }
                       const step = last.analysis.steps.find(s => s.heading === data.heading)
                       if (step) step.thoughts.push(data.thought || '')
                       else last.analysis.steps.push({ heading: data.heading, status: 'running', error: '', thoughts: [data.thought || ''] })
@@ -173,7 +172,7 @@ export default function App() {
                     const copy = [...prev]
                     const last = copy[copy.length - 1]
                     if (last && last.role === 'agent' && last._streaming) {
-                      if (!last.analysis) last.analysis = { steps: [], totalGroups: 0, completedGroups: 0 }
+                      if (!last.analysis) last.analysis = { steps: [], totalGroups: 0 }
                       const step = last.analysis.steps.find(s => s.heading === data.heading)
                       if (step) step.retry = { attempt: data.attempt, reason: data.reason }
                     }
@@ -183,8 +182,6 @@ export default function App() {
 
                 case 'result':
                   streamedResult = data
-                  // Reset content — subsequent message events from Claude's
-                  // text response will append to this same result message
                   streamedContent = ''
                   streamedProgress = null
                   if (saveToHistoryRef.current) {
@@ -194,9 +191,20 @@ export default function App() {
                       filenames: [...uploadedFiles],
                     })
                   }
-                  // Push a streaming result message — Claude's follow-up text
-                  // will land here via upsertAgentMsg because _streaming is true
-                  setMessages(prev => [...prev, { role: 'agent', _streaming: true, content: '', result: data }])
+                  // Finalize current streaming message (preserve content + analysis),
+                  // then push a new message for the result card
+                  setMessages(prev => {
+                    const copy = [...prev]
+                    const last = copy[copy.length - 1]
+                    if (last && last.role === 'agent' && last._streaming) {
+                      last._streaming = false
+                      last.toolCall = null
+                      last.progress = null
+                    }
+                    // Push a fresh streaming message for the result + any follow-up text
+                    copy.push({ role: 'agent', _streaming: true, content: '', result: data })
+                    return copy
+                  })
                   break
 
                 case 'error':
