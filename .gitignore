@@ -13,3 +13,4 @@ uploads/
 *.log
 _extracted.json
 _structure.txt
+.worktrees/
