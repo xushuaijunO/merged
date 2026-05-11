@@ -43,11 +43,13 @@ SYSTEM_PROMPT = """你是一个专业的文档整合智能助手。你可以帮�
 - `get_document_detail` — 查看某个已解析文档的详细结构和内容概要
 - `analyze_commonality` — AI分析所有文档，规划统一的章节结构（正文+附件映射）
 - `generate_merged_document` — 生成统一操作规程（封面、目录、前言、正文、附件A-N）
+- `set_template` — 将某个已上传文档指定为模板（用户通过对话指定模板时使用，如"模板文件为XXX"）
 
 ## 典型工作流程
 1. 用户上传多个文档
-2. 解析所有文档 → AI分析（规划统一章节+附件映射）→ 生成文档
-3. 告知用户结果
+2. 如果用户通过对话指定模板（如"模板文件为XXX"），先调用set_template指定模板
+3. 解析所有文档 → AI分析（规划统一章节+附件映射）→ 生成文档
+4. 告知用户结果
 
 ## 常见场景处理
 - 用户问"你能做什么" → 介绍你的能力
@@ -112,6 +114,20 @@ TOOLS = [
                 },
             },
             "required": [],
+        },
+    },
+    {
+        "name": "set_template",
+        "description": "将某个已上传文档指定为模板文件。用户说'以XXX为模板'、'模板文件为XXX'、'用XXX做模板'时调用此工具。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "filename": {
+                    "type": "string",
+                    "description": "用户指定的模板文件名。部分匹配即可，不含.docx后缀也可。如用户说'模板文件为运行工岗位操作规程'则传'运行工岗位操作规程'。",
+                },
+            },
+            "required": ["filename"],
         },
     },
 ]
@@ -681,6 +697,40 @@ class MergeAgent:
             }))
 
             return {"data": {"output_file": output_filename}, "_sse_events": sse_events}
+
+        elif tool_name == "set_template":
+            target = tool_input.get("filename", "").strip()
+            if not target:
+                return {"data": {"error": "请指定模板文件名"}, "_sse_events": []}
+            uploaded = session["uploaded_files"]
+            matched = None
+            for f in uploaded:
+                fname = f["filename"]
+                fname_noext = fname.replace(".docx", "").replace(".DOCX", "").strip()
+                target_clean = target.replace(".docx", "").replace(".DOCX", "").strip()
+                if target_clean in fname_noext or fname_noext in target_clean or target_clean in fname:
+                    matched = f
+                    break
+            if matched:
+                filepath = os.path.join(UPLOAD_DIR, f"{matched['file_id']}_{matched['filename']}")
+                if os.path.exists(filepath):
+                    session["template_path"] = filepath
+                    session["template_filename"] = matched["filename"]
+                    return {
+                        "data": {
+                            "status": "ok",
+                            "template": matched["filename"],
+                            "message": f"已将 {matched['filename']} 设为模板文件",
+                        },
+                        "_sse_events": [],
+                    }
+            return {
+                "data": {
+                    "error": f"未找到匹配的模板文件: {target}",
+                    "available_files": [f["filename"] for f in uploaded],
+                },
+                "_sse_events": [],
+            }
 
         else:
             return {"data": {"error": f"未知工具: {tool_name}"}, "_sse_events": []}

@@ -2,7 +2,7 @@
 
 Heading hierarchy (all black, visible in Word navigation pane):
   Heading 1: 目录, 前言, 1-7 body chapters, 附件A-N titles
-  Heading 2: sub-sections (1.1, 1.2...)
+  Heading 2: sub-sections (1.1, 1.2...), appendix top-level sections
   Heading 3: sub-sub-sections (1.1.1...)
 """
 
@@ -14,12 +14,20 @@ from docx import Document
 from docx.shared import Inches, Pt, RGBColor, Cm
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_LEADER
 from docx.oxml.ns import qn
-from docx.oxml import OxmlElement
 
 from analyzer import MergePlan
 
 LINES_PER_PAGE = 28
 BLACK = RGBColor(0, 0, 0)
+
+
+def _strip_markdown(text: str) -> str:
+    """Remove markdown formatting markers: **bold**, *italic*, __bold__, _italic_."""
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+    text = re.sub(r'__(.+?)__', r'\1', text)
+    text = re.sub(r'\*(.+?)\*', r'\1', text)
+    text = re.sub(r'_(.+?)_', r'\1', text)
+    return text.strip()
 
 
 # ====================================================================
@@ -28,7 +36,7 @@ BLACK = RGBColor(0, 0, 0)
 
 def _h1(doc, text):
     """Heading 1: 目录, 前言, chapter titles, appendix titles."""
-    h = doc.add_heading(text, level=1)
+    h = doc.add_heading(_strip_markdown(text), level=1)
     for run in h.runs:
         run.font.color.rgb = BLACK
         run.font.name = "黑体"
@@ -37,7 +45,7 @@ def _h1(doc, text):
 
 def _h2(doc, text):
     """Heading 2: sub-sections like 1.1, 1.2."""
-    h = doc.add_heading(text, level=2)
+    h = doc.add_heading(_strip_markdown(text), level=2)
     for run in h.runs:
         run.font.color.rgb = BLACK
         run.font.name = "黑体"
@@ -46,7 +54,7 @@ def _h2(doc, text):
 
 def _h3(doc, text):
     """Heading 3: sub-sub-sections like 1.1.1."""
-    h = doc.add_heading(text, level=3)
+    h = doc.add_heading(_strip_markdown(text), level=3)
     for run in h.runs:
         run.font.color.rgb = BLACK
         run.font.name = "黑体"
@@ -56,7 +64,7 @@ def _h3(doc, text):
 def _body(doc, text):
     """Normal body paragraph (宋体 10.5pt)."""
     p = doc.add_paragraph()
-    run = p.add_run(text)
+    run = p.add_run(_strip_markdown(text))
     run.font.size = Pt(10.5)
     run.font.name = "宋体"
     run.font.color.rgb = BLACK
@@ -75,7 +83,6 @@ def _table(doc, rows: List[List[str]]):
             if ci < ncols:
                 cell = tbl.rows[ri].cells[ci]
                 cell.text = str(cell_text)
-                # Style header row
                 if ri == 0:
                     for p in cell.paragraphs:
                         for run in p.runs:
@@ -341,77 +348,74 @@ def _collect_toc_headings(merge_plan, docs_data) -> List[dict]:
 # Appendix content cleaning
 # ====================================================================
 
-# Headings already covered in body chapters — skip in appendices
-BODY_SKIP = [
-    '范围', '规范性引用文件', '岗位职责', '岗位风险辨识',
-    '上岗条件', '劳动防护用品', '应急处置要求',
-    '管理职责', '作业范围', '前言', '目录', '目次',
-]
 _ws_re = re.compile(r'\s+')
+_FRONT_MATTER_SKIP = {'前言', '目录', '目次'}
 
 
 def _norm(s: str) -> str:
     return _ws_re.sub('', s).strip()
 
 
-def _clean_appendix_content(text: str) -> str:
-    """Remove body-covered sections from appendix. Number kept sections hierarchically.
+def _should_skip_section(heading: str, body_headings: set) -> bool:
+    """Check if a section heading should be skipped in appendix rendering."""
+    h_norm = _norm(heading)
+    if not h_norm or h_norm == '_preamble':
+        return True
+    if h_norm in _FRONT_MATTER_SKIP:
+        return True
+    for bh in body_headings:
+        bh_norm = _norm(bh)
+        if not bh_norm:
+            continue
+        if h_norm == bh_norm or h_norm.startswith(bh_norm) or bh_norm.startswith(h_norm):
+            return True
+    return False
 
-    Tracks heading depth to assign proper numbering:
-    - Top-level sections: 1., 2., 3.
-    - Sub-sections: 1.1, 1.2, 2.1...
-    """
-    lines = text.split('\n')
-    result = []
-    in_skip = False
-    section_stack = [0]  # [major, minor, ...]
 
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            result.append('')
+def _render_appendix_sections(doc, sections: List[dict], body_headings: set,
+                               image_map: dict, level_prefix=None):
+    """Recursively render source doc sections as appendix content."""
+    if level_prefix is None:
+        level_prefix = [1]
+
+    for sec in sections:
+        sec_heading = sec.get("heading", "").strip()
+
+        if _should_skip_section(sec_heading, body_headings):
             continue
 
-        if stripped.startswith('【') and stripped.endswith('】'):
-            inner = stripped.strip('【】')
-            inner_norm = _norm(inner)
+        has_heading = bool(sec_heading)
+        if has_heading:
+            level = len(level_prefix)
+            num_str = ".".join(str(x) for x in level_prefix)
+            if level >= 3:
+                _h3(doc, f"{num_str} {sec_heading}")
+            elif level >= 2:
+                _h2(doc, f"{num_str} {sec_heading}")
+            else:
+                _h2(doc, f"{num_str} {sec_heading}")
 
-            # Check if covered in body
-            is_covered = False
-            for h in BODY_SKIP:
-                if inner_norm.startswith(_norm(h)):
-                    is_covered = True
-                    break
-            if inner_norm.startswith('_') or inner_norm in ('前言', '目录', '目次'):
-                is_covered = True
+        for p_text in sec.get("paragraphs", []):
+            if p_text.strip():
+                _body(doc, p_text.strip())
 
-            if is_covered:
-                in_skip = True
-                continue
+        section_tables = sec.get("tables", [])
+        for tbl_data in section_tables:
+            if isinstance(tbl_data, list) and tbl_data:
+                _table(doc, tbl_data)
 
-            # Determine depth: check if this is a sub-heading
-            # Heuristic: sub-headings from source docs are shorter and more specific
-            depth = 1  # default top-level
-            # If we detect this as a sub-section (based on source doc heading level hints)
-            # just treat all kept non-covered headings as top-level for now
-            in_skip = False
-            section_stack[0] += 1
-            section_stack = [section_stack[0]]
-            num = f"{section_stack[0]}."
-            result.append(f"【{num} {inner}】")
-            continue
+        matched_images = image_map.get(sec_heading, [])
+        for img in matched_images:
+            _add_image_to_doc(doc, img.blob, img.content_type,
+                              caption=img.filename)
 
-        if in_skip:
-            # Resume when we hit next real section
-            if stripped.startswith('【'):
-                in_skip = False
-                # Re-process this line
-                continue
-            continue
+        children = sec.get("children", [])
+        if children:
+            child_prefix = level_prefix + [1]
+            _render_appendix_sections(doc, children, body_headings, image_map, child_prefix)
 
-        result.append(stripped)
-
-    return '\n'.join(result)
+        if has_heading:
+            level_prefix[-1] += 1
 
 
 # ====================================================================
@@ -438,6 +442,40 @@ def _parse_table_lines(lines: List[str]) -> Optional[List[List[str]]]:
         else:
             break
     return rows if len(rows) >= 2 else None
+
+
+# ====================================================================
+# Image matching helpers
+# ====================================================================
+
+def _build_image_map(all_images_by_doc, source_filename: str) -> dict:
+    """Build a dict mapping section_heading -> list of Image objects."""
+    image_map = {}
+    doc_images = all_images_by_doc.get(source_filename, [])
+    for img in doc_images:
+        if hasattr(img, 'section_heading') and img.section_heading:
+            key = img.section_heading.strip()
+            if key not in image_map:
+                image_map[key] = []
+            image_map[key].append(img)
+    return image_map
+
+
+def _match_body_images(all_images_by_doc, chapter_heading: str) -> list:
+    """Find images from all source docs whose section_heading matches chapter_heading."""
+    from doc_parser import deduplicate_images
+    matched = []
+    ch_clean = chapter_heading.strip()
+    for doc_name, img_list in all_images_by_doc.items():
+        for img in img_list:
+            if hasattr(img, 'section_heading') and img.section_heading:
+                sh = img.section_heading.strip()
+                if sh and (sh in ch_clean or ch_clean in sh):
+                    matched.append(img)
+    if matched:
+        groups = deduplicate_images(matched, threshold=5)
+        return [group[0] for group in groups]
+    return []
 
 
 # ====================================================================
@@ -478,6 +516,14 @@ def generate_merged_docx(merge_plan, docs_data,
             s.left_margin = Cm(2.8)
             s.right_margin = Cm(2.0)
 
+    # Build body_headings set for appendix filtering
+    body_headings = set()
+    for sec in merge_plan.main_sections:
+        h = sec.get("heading", "")
+        h_clean = re.sub(r'^[\d.、\s]+', '', h).strip()
+        if h_clean:
+            body_headings.add(h_clean)
+
     # ================================================================
     # 1. COVER
     # ================================================================
@@ -511,15 +557,17 @@ def generate_merged_docx(merge_plan, docs_data,
             clean_heading = re.sub(r'^[\d.、\s]+', '', heading).strip()
             numbered = f"{chapter_idx + 1} {clean_heading}"
 
-            # Heading 1 for chapter title (same level as 前言)
+            # Heading 1 for chapter title
             _h1(doc, numbered)
+
+            # Per-chapter sub-section counters
+            inner_counter = {"sub2": 0, "sub3": 0}
 
             # Write content with sub-section detection
             for p_text in paragraphs:
                 if not p_text.strip():
                     continue
 
-                # Check if entire paragraph is a table
                 p_lines = p_text.strip().split('\n')
                 table_rows = _parse_table_lines(p_lines)
                 if table_rows:
@@ -531,22 +579,38 @@ def generate_merged_docx(merge_plan, docs_data,
                     if not line:
                         continue
 
-                    # Detect heading patterns: "1.1 xxx", "1.1.1 xxx"
+                    # Detect ## / ### markers for sub-sections
+                    h2_marker = re.match(r'^##\s+(.+)', line)
+                    h3_marker = re.match(r'^###\s+(.+)', line)
+
+                    # Detect numbered heading patterns (fallback)
                     sub2_match = re.match(r'^(\d+)\.(\d+)\s+(.+)', line)
                     sub3_match = re.match(r'^(\d+)\.(\d+)\.(\d+)\s+(.+)', line)
 
-                    if sub3_match:
-                        # Sub-sub-section → Heading 3
+                    if h3_marker:
+                        inner_counter["sub3"] += 1
+                        title = h3_marker.group(1).strip()
+                        new_line = f"{chapter_idx + 1}.{inner_counter['sub2']}.{inner_counter['sub3']} {title}"
+                        _h3(doc, new_line)
+                    elif h2_marker:
+                        inner_counter["sub2"] += 1
+                        inner_counter["sub3"] = 0
+                        title = h2_marker.group(1).strip()
+                        new_line = f"{chapter_idx + 1}.{inner_counter['sub2']} {title}"
+                        _h2(doc, new_line)
+                    elif sub3_match:
                         c, s, ss, title = sub3_match.groups()
+                        inner_counter["sub2"] = int(s)
+                        inner_counter["sub3"] = int(ss)
                         new_line = f"{chapter_idx + 1}.{s}.{ss} {title}"
                         _h3(doc, new_line)
                     elif sub2_match:
-                        # Sub-section → Heading 2
                         old_c, sub_n, title = sub2_match.groups()
+                        inner_counter["sub2"] = int(sub_n)
+                        inner_counter["sub3"] = 0
                         new_line = f"{chapter_idx + 1}.{sub_n} {title}"
                         _h2(doc, new_line)
                     elif re.match(r'^\d+[\.\、]', line):
-                        # Numbered list item → body text
                         _body(doc, line)
                     else:
                         _body(doc, line)
@@ -555,15 +619,11 @@ def generate_merged_docx(merge_plan, docs_data,
             for tbl_rows in tables:
                 _table(doc, tbl_rows)
 
-            # Images
-            for img_info in section.get("images", []):
-                dhash = img_info.get("dhash", "")
-                for doc_name, img_list in all_images_by_doc.items():
-                    for img in img_list:
-                        if hasattr(img, 'dhash') and img.dhash == dhash:
-                            _add_image_to_doc(doc, img.blob, img.content_type,
-                                              caption=img_info.get("caption", ""))
-                            break
+            # Images matching this chapter heading
+            body_images = _match_body_images(all_images_by_doc, clean_heading)
+            for img in body_images:
+                _add_image_to_doc(doc, img.blob, img.content_type,
+                                  caption=img.filename)
 
             doc.add_paragraph()
             chapter_idx += 1
@@ -576,39 +636,31 @@ def generate_merged_docx(merge_plan, docs_data,
             doc.add_page_break()
 
             name = att.get("name", "附件")
-            paragraphs = att.get("paragraphs", [])
+            src_idx = att.get("source_index", -1)
 
             _h1(doc, name)
             doc.add_paragraph()
 
-            for p_text in paragraphs:
-                if not p_text.strip():
+            # Try structured rendering from source doc sections
+            if 0 <= src_idx < len(docs_data):
+                src_doc = docs_data[src_idx]
+                src_sections = src_doc.get("sections", [])
+                src_filename = src_doc.get("filename", "")
+
+                if src_sections:
+                    image_map = _build_image_map(all_images_by_doc, src_filename)
+                    _render_appendix_sections(
+                        doc, src_sections, body_headings, image_map, [1],
+                    )
                     continue
-                cleaned = _clean_appendix_content(p_text.strip())
 
-                for chunk in cleaned.split("\n\n"):
-                    chunk = chunk.strip()
-                    if not chunk:
-                        continue
-
-                    for line in chunk.split("\n"):
+            # Fallback: render flat paragraphs if no structured sections
+            paragraphs = att.get("paragraphs", [])
+            for p_text in paragraphs:
+                if p_text.strip():
+                    for line in p_text.strip().split("\n"):
                         line = line.strip()
-                        if not line:
-                            continue
-                        if line.startswith("【") and line.endswith("】"):
-                            inner = line.strip("【】")
-                            # Only make a heading if it looks like a REAL section heading:
-                            # - Not ending with sentence punctuation 。；！
-                            # - Not a long sentence (>20 chars, likely operational content)
-                            # - Not ending with a parenthetical note
-                            is_sentence_end = inner.endswith('。') or inner.endswith('；') or inner.endswith('！')
-                            is_long = len(inner) > 20
-                            is_operational = any(kw in inner for kw in ['打开', '关闭', '按下', '检查', '确认', '启动', '停止'])
-                            if not is_sentence_end and not is_long and not is_operational and len(inner) > 3:
-                                _h2(doc, inner)
-                            else:
-                                _body(doc, inner)
-                        else:
+                        if line:
                             _body(doc, line)
 
     doc.save(output_path)

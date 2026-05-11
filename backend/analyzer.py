@@ -277,10 +277,11 @@ def _build_section_synthesis_prompt(heading: str, all_source_texts: List[dict],
 - 提取所有源文件中与「{heading}」相关的内容，融合为通顺、精炼的表述
 - 只写概括性、原则性的内容，不写详细的分步操作步骤
 - 如果某操作有详细步骤在附件中，引用附件：如"具体操作参照《附件A：XXX》"
-- **使用编号的子标题**：如果该章节下有多个子主题，使用"6.1 xxx"、"6.2 xxx"等编号格式
-- **内容用列表组织**：子标题下的内容尽量用"1. xxx\n2. xxx\n3. xxx"的编号列表形式逐条列出，清晰易读
+- **子标题标记**：如果该章节下有多个子主题，二级标题以"## "开头（如"## 岗位与巡检"），三级标题以"### "开头（如"### 操作前准备"）。不要自行添加任何数字编号，编号由系统自动生成
+- **内容用列表组织**：子标题下的内容尽量用"a) xxx\nb) xxx\nc) xxx"或"1. xxx\n2. xxx"的编号列表形式逐条列出，清晰易读
 - **适合表格的内容用表格**：如果内容是规格参数、对比信息、清单类数据，用"| 列1 | 列2 |"的markdown表格格式输出
 - **不要给章节标题本身加编号**（标题编号由系统自动添加），直接写正文内容
+- **不要使用markdown格式**：不要使用**加粗**、*斜体*等markdown标记，直接输出纯文本内容
 - 保持企业标准文档的专业、简洁风格
 - 不要标注"共性"、"独有"等字样
 - 不要标注"来源文档"等字样
@@ -547,12 +548,12 @@ def analyze_documents(docs_data: List[dict],
         if 0 <= src_idx < len(docs_data):
             src_doc = docs_data[src_idx]
             att_text = _flatten_full_text(src_doc.get("sections", []))
-            # Clean attachment name: remove .docx, doc numbers, extra prefixes
             raw_name = att_info.get("name", f"附件{chr(65 + src_idx)}")
             clean_name = _clean_attachment_name(raw_name, src_doc.get("filename", ""))
             plan.attachments.append({
                 "name": clean_name,
-                "paragraphs": [att_text],
+                "paragraphs": [att_text],  # Kept for fallback when sections are empty
+                "sections": src_doc.get("sections", []),  # Structured sections for rendering
                 "level": 1,
                 "source_index": src_idx,
             })
