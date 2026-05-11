@@ -22,42 +22,37 @@ from analyzer import analyze_documents
 
 logger = logging.getLogger("agent")
 
-SYSTEM_PROMPT = """你是一个专业的文档合并智能助手。你可以帮助用户管理和合并Word文档（.docx格式）。
+SYSTEM_PROMPT = """你是一个专业的文档整合智能助手。你可以帮助用户将多个Word文档（.docx格式）整合为统一的企业操作规程。
 
 ## 你的身份
-你是一个友好、专业的AI助手，像一位耐心的文档专家。你可以：
-- 回答用户关于文档合并的任何问题
-- 帮助用户理解文档的内容和结构
-- 执行文档合并任务
-- 在合并过程中保持与用户的实时沟通
+你是一个专业的企业文档编辑助手。你产出的不是简单的"合并文档"，而是凝练后的统一操作规程：
+- **正文**：综合所有源文件的共性内容，提炼为统一的章节。写作风格为概括性、原则性表述。
+- **附件**：每个源文件对应一个附件（附件A、附件B...），保留各自的操作细节。
+- **引用**：正文中通过"具体操作参照《附件A：XXX》"引用附件。
+- 正文中**不出现**"共性"、"独有"、"来源文档"等字样。
 
 ## 工作原则
-1. **自然对话**：始终保持友好、自然的对话风格。用户在跟你聊天，不是在下达命令。
-2. **主动汇报**：执行每个步骤时都要告知用户，让用户感知到进展。
-3. **灵活应变**：根据用户的自然语言描述理解他们的真正需求，而不是执行固定的流程。
+1. **自然对话**：保持友好、自然的对话风格。
+2. **主动汇报**：执行每个步骤时告知用户进展。
+3. **灵活应变**：根据用户需求调整文档结构。
 4. **用中文回复**，保持简洁清晰。
 
 ## 可用的工具
-你可以使用以下工具来完成文档合并任务：
 - `get_session_info` — 查看当前会话中已上传的文档信息
 - `parse_documents` — 解析已上传的文档，提取结构化内容（章节、图片、表格）
 - `get_document_detail` — 查看某个已解析文档的详细结构和内容概要
-- `analyze_commonality` — 使用AI分析多个文档的共性内容和独有内容
-- `generate_merged_document` — 根据分析结果生成合并后的Word文档
+- `analyze_commonality` — AI分析所有文档，规划统一的章节结构（正文+附件映射）
+- `generate_merged_document` — 生成统一操作规程（封面、目录、前言、正文、附件A-N）
 
 ## 典型工作流程
-当用户表达合并意图时：
-1. 先检查是否已上传足够文档（至少2个）
-2. 告知用户即将开始，说明步骤
-3. 依次调用工具：解析 → 分析 → 生成
-4. 每个步骤完成后向用户汇报结果
-5. 生成完成后提供下载链接
+1. 用户上传多个文档
+2. 解析所有文档 → AI分析（规划统一章节+附件映射）→ 生成文档
+3. 告知用户结果
 
 ## 常见场景处理
 - 用户问"你能做什么" → 介绍你的能力
-- 用户问"这个文档内容是什么" → 先解析文档，再用get_document_detail查看
-- 用户说"合并这些文档" → 确认后开始合并流程
-- **重要**：用户指定文件名时（如"合并成xxx"、"文件名叫xxx"、"命名为xxx"、"保存为xxx"、"叫xxx"、"文件名是xxx"、"输出xxx"等），你**必须**在调用generate_merged_document时将文件名作为filename参数传入（不含.docx后缀）。不要忽略用户指定的文件名。
+- 用户说"整合这些文档" → 确认后开始流程
+- **重要**：用户指定文件名时必须传入generate_merged_document的filename参数
 - 用户只上传1个文档 → 提醒需要至少2个
 - 用户上传非docx文件 → 提示仅支持docx格式
 - 用户闲聊（你好、谢谢等） → 正常回复
@@ -98,7 +93,7 @@ TOOLS = [
     },
     {
         "name": "analyze_commonality",
-        "description": "使用AI分析所有已解析文档，识别共性章节和每个文档的独有内容。这是合并前的必要步骤。",
+        "description": "AI分析所有已解析文档，规划统一操作规程的章节结构：正文综合提炼所有源文件的共有内容（概括性表述），每个源文件对应一个附件（保留详细操作步骤）。这是生成文档前的必要步骤。",
         "input_schema": {
             "type": "object",
             "properties": {},
@@ -107,13 +102,13 @@ TOOLS = [
     },
     {
         "name": "generate_merged_document",
-        "description": "根据分析结果生成合并后的Word文档。文档包含：封面、目录、共性内容（第一部分）、各文档独有内容（第二部分）。图片会放置在与内容相关的章节中。如果用户指定了文件名，请将其作为filename参数传入。",
+        "description": "生成统一操作规程文档。包含：企业标准封面、目录、前言、正文（AI凝练的统一章节）、附件A-N（各源文件的详细操作内容）。如果用户指定了文件名，请将其作为filename参数传入。",
         "input_schema": {
             "type": "object",
             "properties": {
                 "filename": {
                     "type": "string",
-                    "description": "【重要】用户指定的合并文档文件名（不含.docx后缀）。用户说'合并成xxx'、'文件名叫xxx'、'命名为xxx'、'保存为xxx'、'叫xxx'则传'xxx'。必须认真检查用户消息中是否包含文件名意图，有的话必须传入。用户没有指定时才传空字符串。",
+                    "description": "【重要】用户指定的输出文件名（不含.docx后缀）。用户说'叫xxx'、'命名为xxx'则传'xxx'。用户没有指定时才传空字符串。",
                 },
             },
             "required": [],
@@ -190,8 +185,8 @@ class MergeAgent:
         if session["merge_plan"]:
             m = session["merge_plan"].summary
             context_parts.append(
-                f"分析已完成: {m.get('common_sections', 0)}个共性章节, "
-                f"{m.get('doc_specific_total', 0)}项独有内容"
+                f"分析已完成: {m.get('main_sections', 0)}个正文章节, "
+                f"{m.get('attachments', 0)}个附件"
             )
         if session["output_path"]:
             context_parts.append(
@@ -517,6 +512,17 @@ class MergeAgent:
                 "percent": 30,
             })
 
+            # Check for template
+            template_sections = None
+            template_path = session.get("template_path")
+            if template_path and os.path.exists(template_path):
+                from template_parser import parse_template
+                try:
+                    skeleton = parse_template(template_path)
+                    template_sections = skeleton.sections
+                except Exception:
+                    pass
+
             docs_data = [d.to_dict() for d in parsed]
             aq: asyncio.Queue = asyncio.Queue()
 
@@ -530,65 +536,17 @@ class MergeAgent:
 
             async def run_analysis():
                 return await loop.run_in_executor(
-                    None, analyze_documents, docs_data, on_progress,
+                    None, analyze_documents, docs_data, template_sections, on_progress,
                 )
 
             analysis_task = asyncio.ensure_future(run_analysis())
 
             # Stream progress events while analysis runs
-            total_groups = 0
-            completed_groups = 0
             while not analysis_task.done():
                 try:
                     event_type, data = await asyncio.wait_for(aq.get(), timeout=0.1)
-                    if event_type == "step_start":
-                        completed_groups = data.get("current", 0)
-                        total_groups = data.get("total", 0)
-                        pct = 30 + int(30 * completed_groups / max(total_groups, 1))
-                        emit("analysis_step", {
-                            "heading": data.get("heading", ""),
-                            "current": completed_groups,
-                            "total": total_groups,
-                            "status": "running",
-                        })
-                        emit("progress", {
-                            "stage": "analyzing",
-                            "message": f"AI语义分析 ({completed_groups}/{total_groups}): {data.get('heading', '')}",
-                            "percent": pct,
-                        })
-                    elif event_type == "thinking":
-                        emit("thinking", {
-                            "heading": data.get("heading", ""),
-                            "thought": data.get("thought", ""),
-                        })
-                    elif event_type == "retry":
-                        emit("retry", {
-                            "heading": data.get("heading", ""),
-                            "attempt": data.get("attempt", 0),
-                            "reason": data.get("reason", ""),
-                        })
-                    elif event_type == "step_done":
-                        completed_groups = data.get("current", completed_groups + 1)
-                        pct = 30 + int(30 * completed_groups / max(total_groups, 1))
-                        emit("analysis_step", {
-                            "heading": data.get("heading", ""),
-                            "current": completed_groups,
-                            "total": data.get("total", total_groups),
-                            "status": "done",
-                        })
-                        emit("progress", {
-                            "stage": "analyzing",
-                            "message": f"AI语义分析 ({completed_groups}/{total_groups}): {data.get('heading', '')}",
-                            "percent": pct,
-                        })
-                    elif event_type == "step_error":
-                        emit("analysis_step", {
-                            "heading": data.get("heading", ""),
-                            "current": completed_groups,
-                            "total": total_groups,
-                            "status": "error",
-                            "error": data.get("error", ""),
-                        })
+                    if event_type == "progress":
+                        emit("progress", data)
                 except asyncio.TimeoutError:
                     pass
 
@@ -602,15 +560,10 @@ class MergeAgent:
                 "percent": 65,
             })
 
-            doc_breakdown = {}
-            for doc_name, sections in merge_plan.doc_specific.items():
-                doc_breakdown[doc_name] = len(sections)
-
             return {
                 "data": {
-                    "common_sections": summary.get("common_sections", 0),
-                    "doc_specific_total": summary.get("doc_specific_total", 0),
-                    "per_document": doc_breakdown,
+                    "main_sections": summary.get("main_sections", 0),
+                    "attachments": summary.get("attachments", 0),
                     "mode": summary.get("mode", "unknown"),
                 },
                 "_sse_events": sse_events,
@@ -676,6 +629,16 @@ class MergeAgent:
 
             output_path = os.path.join(UPLOAD_DIR, output_filename)
 
+            # Get template skeleton for styling
+            skeleton = None
+            template_path = session.get("template_path")
+            if template_path and os.path.exists(template_path):
+                from template_parser import parse_template
+                try:
+                    skeleton = parse_template(template_path)
+                except Exception:
+                    pass
+
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(
                 None,
@@ -685,6 +648,8 @@ class MergeAgent:
                 session.get("all_images", {}),
                 output_path,
                 cover_title,
+                skeleton,
+                template_path,
             )
 
             session["output_path"] = output_path
@@ -701,16 +666,17 @@ class MergeAgent:
                 "download_url": f"/api/download/session/{session['id']}",
                 "filename": output_filename,
                 "summary": {
-                    "common_sections": merge_plan.summary.get("common_sections", 0),
-                    "doc_specific_total": merge_plan.summary.get("doc_specific_total", 0),
+                    "main_sections": merge_plan.summary.get("main_sections", 0),
+                    "attachments": merge_plan.summary.get("attachments", 0),
                     "total_docs": len(parsed),
                 },
                 "message": (
-                    f"合并文档已生成！\n\n"
+                    f"统一操作规程已生成！\n\n"
                     f"文档结构：\n"
                     f"- 封面和目录\n"
-                    f"- 第一部分：共性内容（{merge_plan.summary.get('common_sections', 0)}个章节）\n"
-                    f"- 第二部分：各文档独有内容（{merge_plan.summary.get('doc_specific_total', 0)}项）"
+                    f"- 前言\n"
+                    f"- 正文（{merge_plan.summary.get('main_sections', 0)}个章节）\n"
+                    f"- 附件（{merge_plan.summary.get('attachments', 0)}个）"
                 ),
             }))
 
@@ -789,6 +755,17 @@ class MergeAgent:
         session["parsed_docs"] = parsed_docs
         session["all_images"] = all_images
 
+        # Check for template
+        template_sections = None
+        template_path = session.get("template_path")
+        if template_path and os.path.exists(template_path):
+            from template_parser import parse_template as parse_tpl
+            try:
+                skeleton = parse_tpl(template_path)
+                template_sections = skeleton.sections
+            except Exception:
+                pass
+
         docs_info = "\n".join(
             f"- **{p.filename}**：{len(p.sections)}个章节，{len(p.all_images)}张图片，{len(p.all_tables)}个表格"
             for p in parsed_docs
@@ -808,64 +785,16 @@ class MergeAgent:
 
         async def run_analysis():
             return await loop.run_in_executor(
-                None, analyze_documents, docs_data, on_progress,
+                None, analyze_documents, docs_data, template_sections, on_progress,
             )
 
         analysis_task = asyncio.ensure_future(run_analysis())
 
-        total_groups = 0
-        completed_groups = 0
         while not analysis_task.done():
             try:
                 event_type, data = await asyncio.wait_for(aq.get(), timeout=0.1)
-                if event_type == "step_start":
-                    completed_groups = data.get("current", 0)
-                    total_groups = data.get("total", 0)
-                    pct = 30 + int(30 * completed_groups / max(total_groups, 1))
-                    yield self._sse("analysis_step", {
-                        "heading": data.get("heading", ""),
-                        "current": completed_groups,
-                        "total": total_groups,
-                        "status": "running",
-                    })
-                    yield self._sse("progress", {
-                        "stage": "analyzing",
-                        "message": f"AI语义分析 ({completed_groups}/{total_groups}): {data.get('heading', '')}",
-                        "percent": pct,
-                    })
-                elif event_type == "thinking":
-                    yield self._sse("thinking", {
-                        "heading": data.get("heading", ""),
-                        "thought": data.get("thought", ""),
-                    })
-                elif event_type == "retry":
-                    yield self._sse("retry", {
-                        "heading": data.get("heading", ""),
-                        "attempt": data.get("attempt", 0),
-                        "reason": data.get("reason", ""),
-                    })
-                elif event_type == "step_done":
-                    completed_groups = data.get("current", completed_groups + 1)
-                    pct = 30 + int(30 * completed_groups / max(total_groups, 1))
-                    yield self._sse("analysis_step", {
-                        "heading": data.get("heading", ""),
-                        "current": completed_groups,
-                        "total": data.get("total", total_groups),
-                        "status": "done",
-                    })
-                    yield self._sse("progress", {
-                        "stage": "analyzing",
-                        "message": f"AI语义分析 ({completed_groups}/{total_groups}): {data.get('heading', '')}",
-                        "percent": pct,
-                    })
-                elif event_type == "step_error":
-                    yield self._sse("analysis_step", {
-                        "heading": data.get("heading", ""),
-                        "current": completed_groups,
-                        "total": total_groups,
-                        "status": "error",
-                        "error": data.get("error", ""),
-                    })
+                if event_type == "progress":
+                    yield self._sse("progress", data)
             except asyncio.TimeoutError:
                 pass
 
@@ -880,9 +809,9 @@ class MergeAgent:
         yield self._sse("message", {
             "text": (
                 f"📊 分析结果：\n"
-                f"- 共性章节：**{m.get('common_sections', 0)}**个\n"
-                f"- 独有内容：**{m.get('doc_specific_total', 0)}**项\n\n"
-                f"正在生成合并文档..."
+                f"- 正文章节：**{m.get('main_sections', 0)}**个\n"
+                f"- 附件：**{m.get('attachments', 0)}**个\n\n"
+                f"正在生成统一操作规程..."
             ),
         })
 
@@ -891,10 +820,22 @@ class MergeAgent:
         })
 
         from merger import generate_merged_docx
+
+        # Get skeleton for styling
+        skeleton = None
+        template_path = session.get("template_path")
+        if template_path and os.path.exists(template_path):
+            from template_parser import parse_template as parse_tpl
+            try:
+                skeleton = parse_tpl(template_path)
+            except Exception:
+                pass
+
         output_filename = f"merged_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
         output_path = os.path.join(UPLOAD_DIR, output_filename)
         await loop.run_in_executor(
-            None, generate_merged_docx, merge_plan, docs_data, all_images, output_path
+            None, generate_merged_docx, merge_plan, docs_data, all_images, output_path,
+            merge_plan.cover_title, skeleton, template_path,
         )
 
         session["output_path"] = output_path
@@ -907,9 +848,9 @@ class MergeAgent:
             "filename": output_filename,
             "summary": m,
             "message": (
-                f"🎉 **合并完成！**\n\n"
-                f"文档包含：封面、目录、{m.get('common_sections', 0)}个共性章节、"
-                f"{m.get('doc_specific_total', 0)}项独有内容。"
+                f"🎉 **生成完成！**\n\n"
+                f"文档包含：封面、目录、前言、{m.get('main_sections', 0)}个正文章节、"
+                f"{m.get('attachments', 0)}个附件。"
             ),
         })
 
@@ -930,6 +871,15 @@ class MergeAgent:
             "added": len(added),
             "filenames": [f["filename"] for f in session["uploaded_files"]],
         }
+
+    def set_template(self, session_id: str, template_path: str, template_filename: str):
+        """Set a template file for the session."""
+        session = self.sessions.get(session_id)
+        if not session:
+            return {"error": "Session not found"}
+        session["template_path"] = template_path
+        session["template_filename"] = template_filename
+        return {"status": "ok", "template": template_filename}
 
     def clear_session_files(self, session_id: str):
         session = self.sessions.get(session_id)

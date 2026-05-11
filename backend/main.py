@@ -119,14 +119,39 @@ async def _run_merge(task_id: str, file_infos: list):
 
         await emit("progress", {"stage": "analyzing", "message": "AI语义分析中...", "percent": 25})
         docs_data = [d.to_dict() for d in parsed_docs]
+
+        # Check for template
+        template_sections = None
+        template_path = task.get("template_path")
+        if template_path and os.path.exists(template_path):
+            from template_parser import parse_template
+            try:
+                skeleton = parse_template(template_path)
+                template_sections = skeleton.sections
+                await emit("progress", {"stage": "analyzing", "message": f"按模板结构分析: {len(template_sections)}个章节", "percent": 27})
+            except Exception as e:
+                logging.warning("Template parsing failed: %s", e)
+
         loop = asyncio.get_event_loop()
-        merge_plan = await loop.run_in_executor(None, analyze_documents, docs_data)
+        merge_plan = await loop.run_in_executor(None, analyze_documents, docs_data, template_sections)
         await emit("progress", {"stage": "analyzing", "message": "分析完成", "percent": 65})
 
-        await emit("progress", {"stage": "merging", "message": "生成合并文档...", "percent": 75})
+        await emit("progress", {"stage": "merging", "message": "生成统一操作规程...", "percent": 75})
+
+        # Get skeleton for styling
+        skeleton = None
+        template_path = task.get("template_path")
+        if template_path and os.path.exists(template_path):
+            from template_parser import parse_template
+            try:
+                skeleton = parse_template(template_path)
+            except Exception:
+                pass
+
         output_filename = f"merged_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
         output_path = os.path.join(UPLOAD_DIR, output_filename)
-        await loop.run_in_executor(None, generate_merged_docx, merge_plan, docs_data, all_images, output_path)
+        tpl_path = task.get("template_path")
+        await loop.run_in_executor(None, generate_merged_docx, merge_plan, docs_data, all_images, output_path, merge_plan.cover_title, skeleton, tpl_path)
 
         task["output_path"] = output_path
         task["output_filename"] = output_filename
@@ -295,6 +320,14 @@ async def chat_upload(session_id: str, req: Request):
         uploaded.append(file_info)
 
     result = agent.add_files_to_session(session_id, uploaded)
+
+    # Auto-detect template files: single file with "模板" or "template" in name
+    if len(uploaded) == 1:
+        fname = uploaded[0]["filename"]
+        if "模板" in fname or "template" in fname.lower():
+            agent.set_template(session_id, uploaded[0]["path"], fname)
+            result["template_detected"] = True
+
     return result
 
 

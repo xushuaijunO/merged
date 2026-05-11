@@ -1,532 +1,615 @@
-"""Merger: generates the final merged docx from the MergePlan.
+"""Merger: generates the final unified operating procedure docx.
 
-Enhanced with paragraph-level image insertion and dHash deduplication.
-Images are placed after the matching paragraph text, not just at section end.
+Heading hierarchy (all black, visible in Word navigation pane):
+  Heading 1: 目录, 前言, 1-7 body chapters, 附件A-N titles
+  Heading 2: sub-sections (1.1, 1.2...)
+  Heading 3: sub-sub-sections (1.1.1...)
 """
 
 import os
 import io as std_io
-from datetime import datetime
+import re
 from typing import List, Dict, Optional
 from docx import Document
 from docx.shared import Inches, Pt, RGBColor, Cm
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_LEADER
 from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
 
 from analyzer import MergePlan
 
-
-TOC_LEVELS = {1: "Heading 1", 2: "Heading 2", 3: "Heading 3"}
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _set_heading_style(doc, level, text):
-    return doc.add_heading(text, level=min(level, 9))
+LINES_PER_PAGE = 28
+BLACK = RGBColor(0, 0, 0)
 
 
-def _add_paragraph(doc, text, bold=False):
-    para = doc.add_paragraph()
-    run = para.add_run(text)
-    run.bold = bold
-    return para
+# ====================================================================
+# Heading helpers — all black, all use Word heading styles for nav pane
+# ====================================================================
+
+def _h1(doc, text):
+    """Heading 1: 目录, 前言, chapter titles, appendix titles."""
+    h = doc.add_heading(text, level=1)
+    for run in h.runs:
+        run.font.color.rgb = BLACK
+        run.font.name = "黑体"
+    return h
+
+
+def _h2(doc, text):
+    """Heading 2: sub-sections like 1.1, 1.2."""
+    h = doc.add_heading(text, level=2)
+    for run in h.runs:
+        run.font.color.rgb = BLACK
+        run.font.name = "黑体"
+    return h
+
+
+def _h3(doc, text):
+    """Heading 3: sub-sub-sections like 1.1.1."""
+    h = doc.add_heading(text, level=3)
+    for run in h.runs:
+        run.font.color.rgb = BLACK
+        run.font.name = "黑体"
+    return h
+
+
+def _body(doc, text):
+    """Normal body paragraph (宋体 10.5pt)."""
+    p = doc.add_paragraph()
+    run = p.add_run(text)
+    run.font.size = Pt(10.5)
+    run.font.name = "宋体"
+    run.font.color.rgb = BLACK
+    return p
+
+
+def _table(doc, rows: List[List[str]]):
+    """Insert a table with header row styled."""
+    if not rows:
+        return
+    ncols = max(len(r) for r in rows)
+    tbl = doc.add_table(rows=len(rows), cols=ncols)
+    tbl.style = 'Table Grid'
+    for ri, row in enumerate(rows):
+        for ci, cell_text in enumerate(row):
+            if ci < ncols:
+                cell = tbl.rows[ri].cells[ci]
+                cell.text = str(cell_text)
+                # Style header row
+                if ri == 0:
+                    for p in cell.paragraphs:
+                        for run in p.runs:
+                            run.bold = True
+                            run.font.size = Pt(9)
+    doc.add_paragraph()
 
 
 def _add_image_to_doc(doc, image_blob, content_type, caption="", width_inches=5.0):
-    """Insert an image with optional caption into the document."""
-    ext = content_type.split("/")[-1]
-    if ext == "jpeg":
-        ext = "jpg"
     image_stream = std_io.BytesIO(image_blob)
     try:
         if caption:
-            cap = _add_paragraph(doc, f"【图】{caption}", bold=False)
+            cap = doc.add_paragraph()
             cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            cap.add_run(f"【图】{caption}")
         doc.add_picture(image_stream, width=Inches(width_inches))
-        last_para = doc.paragraphs[-1]
-        last_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
     except Exception:
         pass
 
 
-def _normalize_for_match(text: str, max_len: int = 20) -> str:
-    """Normalize text for fuzzy matching — used to find anchor paragraphs."""
-    if not text:
-        return ""
-    t = text.strip().replace("\n", "").replace("\r", "")
-    return t[:max_len]
+# ====================================================================
+# Template styles
+# ====================================================================
 
-
-def _find_best_paragraph_index(paragraphs: List[str], anchor_text: str,
-                               context_before: str = "",
-                               context_after: str = "") -> int:
-    """Find the best paragraph index to insert an image after.
-
-    Priority:
-    1. Exact match on anchor_text (from AI image_placement)
-    2. Fuzzy match on context_before (the paragraph right before image in source)
-    3. Fuzzy match on context_after (the paragraph right after image in source)
-    4. Returns -1 if no match (insert at section end)
-    """
-    if not paragraphs:
-        return -1
-
-    anchor = _normalize_for_match(anchor_text)
-    before = _normalize_for_match(context_before)
-    after = _normalize_for_match(context_after)
-
-    # Priority 1: anchor_text exact or contains match
-    if anchor:
-        for i, p in enumerate(paragraphs):
-            p_norm = _normalize_for_match(p, 40)
-            if anchor in p_norm or p_norm in anchor:
-                return i
-
-    # Priority 2: context_before fuzzy match
-    if before:
-        for i, p in enumerate(paragraphs):
-            p_norm = _normalize_for_match(p, 40)
-            if before in p_norm or p_norm in before:
-                return i
-
-    # Priority 3: context_after fuzzy match (insert before the matching paragraph)
-    if after:
-        for i, p in enumerate(paragraphs):
-            p_norm = _normalize_for_match(p, 40)
-            if after in p_norm or p_norm in after:
-                return max(0, i - 1)
-
-    return -1
-
-
-def _build_image_lookup(all_images_by_doc: dict) -> Dict[str, dict]:
-    """Build a lookup: dhash → actual Image object (with blob).
-
-    When multiple images have the same dHash, picks the largest.
-    """
-    lookup = {}
-    for doc_name, img_list in all_images_by_doc.items():
-        for img in img_list:
-            dh = img.dhash if hasattr(img, 'dhash') else ""
-            if not dh:
-                # Try to compute it
+def _apply_template_styles(doc, skeleton):
+    if not skeleton or not skeleton.styles:
+        return
+    for style_name, style_def in skeleton.styles.items():
+        try:
+            if style_name in [s.name for s in doc.styles]:
+                style = doc.styles[style_name]
+            else:
+                continue
+            font = style.font
+            if style_def.font_name:
+                font.name = style_def.font_name
+            if style_def.font_size_pt:
+                font.size = Pt(style_def.font_size_pt)
+            if style_def.bold:
+                font.bold = True
+            if style_def.color:
                 try:
-                    from doc_parser import compute_dhash
-                    dh = compute_dhash(img.blob)
+                    font.color.rgb = RGBColor.from_string(style_def.color)
                 except Exception:
-                    continue
-            if dh not in lookup or len(img.blob) > len(lookup[dh]["blob"]):
-                lookup[dh] = {
-                    "blob": img.blob,
-                    "content_type": img.content_type,
-                    "dhash": dh,
-                    "source_doc": doc_name,
-                    "filename": img.filename if hasattr(img, 'filename') else "",
-                    "context_before": img.context_before if hasattr(img, 'context_before') else "",
-                    "context_after": img.context_after if hasattr(img, 'context_after') else "",
-                }
-    return lookup
+                    pass
+        except Exception:
+            pass
 
 
-def _insert_images_for_paragraphs(doc, image_infos: List[dict],
-                                  image_lookup: Dict[str, dict],
-                                  paragraphs_before: List[str],
-                                  image_placement: List[dict] = None):
-    """Insert images at precise positions relative to paragraphs.
+# ====================================================================
+# Cover
+# ====================================================================
 
-    Args:
-        doc: The Document being built
-        image_infos: Image metadata list (with dhash, context_before, etc.)
-        image_lookup: dhash → actual image blob data
-        paragraphs_before: List of paragraph texts already added for this section
-        image_placement: Optional AI-directed placement from analysis
-    """
-    if not image_infos:
+def _clone_cover_from_template(doc, template_path, cover_title=""):
+    if not template_path or not os.path.exists(template_path):
+        _create_default_cover(doc, cover_title)
         return
 
-    # Keep track of how many images we've inserted after each paragraph
-    # to handle multiple images after the same paragraph
-    insertion_map: Dict[int, List[dict]] = {}
+    src_doc = Document(template_path)
+    cover_paras = []
+    for para in src_doc.paragraphs:
+        text = para.text.strip()
+        style_name = para.style.name if para.style else ""
+        if style_name in ("toc 1", "toc 2", "TOC 1", "TOC 2") or text == "目    录":
+            break
+        if "目录" in text and len(text) < 10:
+            break
+        cover_paras.append(para)
+        if len(cover_paras) >= 20:
+            break
 
-    for img_info in image_infos:
-        dh = img_info.get("dhash", "")
-        actual_img = image_lookup.get(dh)
-        if not actual_img:
-            # Try partial match
-            for key in image_lookup:
-                if key.startswith(dh[:6]) if dh else False:
-                    actual_img = image_lookup[key]
-                    break
-        if not actual_img:
-            continue
+    while len(cover_paras) > 1 and not cover_paras[-1].text.strip():
+        cover_paras.pop()
 
-        # Determine placement
-        anchor = ""
-        ctx_before = img_info.get("context_before", "")
-        ctx_after = img_info.get("context_after", "")
+    title_replaced = False
+    for src_para in cover_paras:
+        text = src_para.text.strip()
+        style_name = src_para.style.name if src_para.style else ""
+        is_title = (style_name == "封面标准名称" or
+                     (("标题" in style_name or "名称" in style_name) and len(text) > 3))
 
-        # If AI gave us placement instructions, use them
-        if image_placement:
-            for ip in image_placement:
-                ip_dh = ip.get("dhash", "")
-                if ip_dh and dh.startswith(ip_dh[:8]):
-                    anchor = ip.get("anchor_text", "")
-                    if ip.get("caption"):
-                        actual_img["caption"] = ip["caption"]
-                    break
+        new_para = doc.add_paragraph()
+        _copy_paragraph_format(src_para, new_para)
 
-        best_idx = _find_best_paragraph_index(
-            paragraphs_before, anchor, ctx_before, ctx_after,
-        )
-
-        # Generate caption if not set
-        if not actual_img.get("caption"):
-            cap_parts = []
-            if ctx_before:
-                cap_parts.append(ctx_before[:30])
-            elif ctx_after:
-                cap_parts.append(ctx_after[:30])
-            if actual_img.get("source_doc"):
-                cap_parts.append(f"来源: {actual_img['source_doc']}")
-            actual_img["caption"] = " - ".join(cap_parts) if cap_parts else "图片"
-
-        if best_idx not in insertion_map:
-            insertion_map[best_idx] = []
-        insertion_map[best_idx].append(actual_img)
-
-    # Now insert images after their target paragraphs
-    # We work backwards through paragraphs to avoid index shifting
-    # (since we can only add images at the end of the doc, we use a
-    # different strategy: track what to insert for each paragraph index)
-
-    # Since python-docx doesn't support inserting at arbitrary positions,
-    # we use a two-pass approach: first add all paragraphs, then insert
-    # images between them by tracking paragraph objects
-    #
-    # Actually, the cleanest approach: during the paragraph-writing loop,
-    # after writing paragraph i, check if i is in insertion_map and insert.
-    # We pass the insertion_map to the caller and handle it there.
-
-
-def _write_paragraphs_with_images(doc, paragraphs: List[str],
-                                  images_to_insert: Dict[int, List[dict]]):
-    """Write paragraphs, inserting images after matching paragraphs.
-
-    Args:
-        doc: The Document
-        paragraphs: Paragraph texts to write
-        images_to_insert: Map of paragraph_index → list of image dicts
-    """
-    for i, p_text in enumerate(paragraphs):
-        if p_text.strip():
-            _add_paragraph(doc, p_text.strip())
-        # Insert any images that should come after this paragraph
-        imgs = images_to_insert.get(i, [])
-        for img in imgs:
-            _add_image_to_doc(
-                doc, img["blob"], img["content_type"],
-                caption=img.get("caption", ""),
-            )
-
-    # Insert images with index -1 (no matching paragraph → at section end)
-    fallback_imgs = images_to_insert.get(-1, [])
-    if fallback_imgs:
-        for img in fallback_imgs:
-            _add_image_to_doc(
-                doc, img["blob"], img["content_type"],
-                caption=img.get("caption", ""),
-            )
-
-
-# ---------------------------------------------------------------------------
-# Cover & TOC
-# ---------------------------------------------------------------------------
-
-def _create_cover(doc, doc_count, filenames, cover_title="文档合并汇编"):
-    """Create a unified cover page."""
-    for _ in range(6):
-        doc.add_paragraph()
-
-    title_para = doc.add_paragraph()
-    title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = title_para.add_run(cover_title)
-    run.font.size = Pt(26)
-    run.bold = True
-    run.font.color.rgb = RGBColor(0x1A, 0x1A, 0x1A)
-
-    sub_para = doc.add_paragraph()
-    sub_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = sub_para.add_run("合并文档")
-    run.font.size = Pt(16)
-    run.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
-
-    doc.add_paragraph()
-    doc.add_paragraph()
-
-    info_para = doc.add_paragraph()
-    info_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = info_para.add_run(f"合并文档数量：{doc_count} 份")
-    run.font.size = Pt(12)
-
-    names_para = doc.add_paragraph()
-    names_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    names = "、".join(filenames[:3]) + ("..." if len(filenames) > 3 else "")
-    run = names_para.add_run(names)
-    run.font.size = Pt(10)
-    run.font.color.rgb = RGBColor(0x88, 0x88, 0x88)
-
-    doc.add_paragraph()
-    doc.add_paragraph()
-
-    date_para = doc.add_paragraph()
-    date_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = date_para.add_run(f"生成日期：{datetime.now().strftime('%Y-%m-%d')}")
-    run.font.size = Pt(11)
-    run.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
+        if is_title and cover_title and not title_replaced:
+            new_para.clear()
+            run = new_para.add_run(cover_title)
+            _copy_run_format(src_para.runs[0] if src_para.runs else None, run)
+            title_replaced = True
+        else:
+            for src_run in src_para.runs:
+                new_run = new_para.add_run(src_run.text)
+                _copy_run_format(src_run, new_run)
 
     doc.add_page_break()
 
 
-def _generate_real_toc(doc, headings: List[dict]):
-    """Generate a text-based table of contents."""
-    _set_heading_style(doc, 1, "目录")
+def _copy_paragraph_format(src_para, dst_para):
+    dst_para.alignment = src_para.alignment
+    pf = src_para.paragraph_format
+    if pf:
+        if pf.space_before:
+            dst_para.paragraph_format.space_before = pf.space_before
+        if pf.space_after:
+            dst_para.paragraph_format.space_after = pf.space_after
+        if pf.line_spacing:
+            dst_para.paragraph_format.line_spacing = pf.line_spacing
+
+
+def _copy_run_format(src_run, dst_run):
+    if src_run is None:
+        return
+    if src_run.font.name:
+        dst_run.font.name = src_run.font.name
+    if src_run.font.size:
+        dst_run.font.size = src_run.font.size
+    if src_run.bold:
+        dst_run.bold = src_run.bold
+    if src_run.italic:
+        dst_run.italic = src_run.italic
+    if src_run.font.color and src_run.font.color.rgb:
+        dst_run.font.color.rgb = src_run.font.color.rgb
+
+
+def _create_default_cover(doc, cover_title=""):
+    for _ in range(6):
+        doc.add_paragraph()
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = p.add_run("上海浦东威立雅自来水有限公司企业标准")
+    run.font.size = Pt(16)
+    doc.add_paragraph()
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = p.add_run(cover_title or "操作规程")
+    run.font.size = Pt(26)
+    run.bold = True
+    doc.add_paragraph()
+    doc.add_paragraph()
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = p.add_run("上海浦东威立雅自来水有限公司  发布")
+    run.font.size = Pt(14)
+    doc.add_page_break()
+
+
+# ====================================================================
+# TOC
+# ====================================================================
+
+def _estimate_page_numbers(headings: List[dict],
+                           main_sections: List[dict],
+                           attachments: List[dict]) -> List[int]:
+    pages = []
+    current_page = 3  # cover=1, toc=2
+    pages.append(current_page)
+    current_page += 1  # preface
+    for section in main_sections:
+        pages.append(current_page)
+        para_text = "\n".join(section.get("paragraphs", []))
+        line_count = max(1, para_text.count('\n') + 1)
+        current_page += max(1, (line_count + 4) // LINES_PER_PAGE)
+    for att in attachments:
+        pages.append(current_page)
+        para_text = "\n".join(att.get("paragraphs", []))
+        line_count = max(1, para_text.count('\n') + 1)
+        current_page += max(1, (line_count + 2) // LINES_PER_PAGE)
+    return pages
+
+
+def _generate_text_toc(doc, headings: List[dict],
+                       main_sections: List[dict],
+                       attachments: List[dict]):
+    page_nums = _estimate_page_numbers(headings, main_sections, attachments)
+    _h1(doc, "目    录")
     doc.add_paragraph()
 
-    for item in headings:
+    for i, item in enumerate(headings):
         level = item.get("level", 2)
         text = item.get("text", "")
         if not text:
             continue
-        indent = max(0, level - 1) * 0.8
+
         para = doc.add_paragraph()
+        indent = max(0, level - 1) * 0.6
         para.paragraph_format.left_indent = Cm(indent)
+
+        tab_stops = para.paragraph_format.tab_stops
+        tab_stops.add_tab_stop(
+            Cm(14.5), alignment=WD_ALIGN_PARAGRAPH.RIGHT, leader=WD_TAB_LEADER.DOTS
+        )
+
         run = para.add_run(text)
         run.font.size = Pt(11) if level <= 2 else Pt(10)
-        run.font.color.rgb = RGBColor(0x33, 0x33, 0x33)
+        run.font.name = "宋体"
+        run.font.color.rgb = BLACK
+
+        run2 = para.add_run("\t")
+        page_str = str(page_nums[i]) if i < len(page_nums) else ""
+        run3 = para.add_run(page_str)
+        run3.font.size = Pt(11) if level <= 2 else Pt(10)
 
     doc.add_page_break()
 
 
-def _insert_table(doc, table_rows):
-    """Insert a table into the document."""
-    if not table_rows:
-        return
-    num_cols = len(table_rows[0]) if table_rows else 1
-    table = doc.add_table(rows=len(table_rows), cols=num_cols)
-    table.style = 'Table Grid'
-    for ri, row_data in enumerate(table_rows):
-        for ci, cell_text in enumerate(row_data):
-            if ci < num_cols:
-                table.rows[ri].cells[ci].text = cell_text
+# ====================================================================
+# Preface
+# ====================================================================
+
+def _generate_preface(doc, template_path=None):
+    doc.add_page_break()
+    _h1(doc, "前    言")
     doc.add_paragraph()
 
+    if template_path and os.path.exists(template_path):
+        src_doc = Document(template_path)
+        in_preface = False
+        copied = 0
+        for para in src_doc.paragraphs:
+            text = para.text.strip()
+            style = para.style.name if para.style else ""
+            if "前言" in text and ("前言、引言标题" in style or len(text) <= 6):
+                in_preface = True
+                continue
+            if in_preface:
+                if style in ("Heading 1", "Heading 2", "章标题", "一级条标题",
+                              "前言、引言标题") and text and "前言" not in text:
+                    break
+                if text:
+                    _body(doc, text)
+                    copied += 1
+                    if copied > 10:
+                        break
+
+    last_text = doc.paragraphs[-1].text.strip() if doc.paragraphs else ""
+    if not last_text or last_text == "前    言":
+        _body(doc, "本标准按照企业标准编写规范起草。")
+        _body(doc, "本标准由上海浦东威立雅自来水有限公司浦东水厂生产管理科提出并归口。")
+        _body(doc, "本标准起草部门：浦东水厂生产管理科。")
+
+    doc.add_page_break()
+
+
+# ====================================================================
+# TOC heading collector
+# ====================================================================
 
 def _collect_toc_headings(merge_plan, docs_data) -> List[dict]:
-    """Walk the merge plan and collect all headings for TOC."""
-    headings = []
-
-    headings.append({"level": 1, "text": "第一部分：共性内容"})
-
-    if merge_plan.common_sections:
-        for section in merge_plan.common_sections:
-            h = section.get("heading", "")
-            if h and not h.startswith("_"):
-                headings.append({
-                    "level": min(section.get("level", 1) + 1, 3),
-                    "text": h,
-                })
-
-    headings.append({"level": 1, "text": "第二部分：各文档独有内容"})
-
-    for doc_name, sections in merge_plan.doc_specific.items():
-        headings.append({"level": 2, "text": f"来源文档：{doc_name}"})
-        for section in sections:
-            h = section.get("heading", "")
-            if h and not h.startswith("_"):
-                headings.append({
-                    "level": min(section.get("level", 1) + 2, 3),
-                    "text": h,
-                })
-
+    headings = [{"level": 1, "text": "前言"}]
+    for i, section in enumerate(merge_plan.main_sections):
+        h = section.get("heading", "")
+        if h and "前言" not in h and "目录" not in h:
+            clean = re.sub(r'^[\d.、\s]+', '', h).strip()
+            headings.append({"level": 1, "text": f"{i + 1} {clean}"})
+    if merge_plan.attachments:
+        for att in merge_plan.attachments:
+            headings.append({"level": 1, "text": att.get("name", "附件")})
     return headings
 
 
-# ---------------------------------------------------------------------------
-# Main generator
-# ---------------------------------------------------------------------------
+# ====================================================================
+# Appendix content cleaning
+# ====================================================================
 
-def generate_merged_docx(merge_plan: MergePlan, docs_data: List[dict],
-                         all_images_by_doc: dict, output_path: str,
-                         cover_title: str = "文档合并汇编") -> str:
-    """Generate the final merged docx with precise image placement.
+# Headings already covered in body chapters — skip in appendices
+BODY_SKIP = [
+    '范围', '规范性引用文件', '岗位职责', '岗位风险辨识',
+    '上岗条件', '劳动防护用品', '应急处置要求',
+    '管理职责', '作业范围', '前言', '目录', '目次',
+]
+_ws_re = re.compile(r'\s+')
 
-    Images are now inserted after the matching paragraph (using context_before /
-    context_after / AI image_placement), not just at section end.
-    Duplicate images (same dHash) are inserted only once.
+
+def _norm(s: str) -> str:
+    return _ws_re.sub('', s).strip()
+
+
+def _clean_appendix_content(text: str) -> str:
+    """Remove body-covered sections from appendix. Number kept sections hierarchically.
+
+    Tracks heading depth to assign proper numbering:
+    - Top-level sections: 1., 2., 3.
+    - Sub-sections: 1.1, 1.2, 2.1...
     """
+    lines = text.split('\n')
+    result = []
+    in_skip = False
+    section_stack = [0]  # [major, minor, ...]
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            result.append('')
+            continue
+
+        if stripped.startswith('【') and stripped.endswith('】'):
+            inner = stripped.strip('【】')
+            inner_norm = _norm(inner)
+
+            # Check if covered in body
+            is_covered = False
+            for h in BODY_SKIP:
+                if inner_norm.startswith(_norm(h)):
+                    is_covered = True
+                    break
+            if inner_norm.startswith('_') or inner_norm in ('前言', '目录', '目次'):
+                is_covered = True
+
+            if is_covered:
+                in_skip = True
+                continue
+
+            # Determine depth: check if this is a sub-heading
+            # Heuristic: sub-headings from source docs are shorter and more specific
+            depth = 1  # default top-level
+            # If we detect this as a sub-section (based on source doc heading level hints)
+            # just treat all kept non-covered headings as top-level for now
+            in_skip = False
+            section_stack[0] += 1
+            section_stack = [section_stack[0]]
+            num = f"{section_stack[0]}."
+            result.append(f"【{num} {inner}】")
+            continue
+
+        if in_skip:
+            # Resume when we hit next real section
+            if stripped.startswith('【'):
+                in_skip = False
+                # Re-process this line
+                continue
+            continue
+
+        result.append(stripped)
+
+    return '\n'.join(result)
+
+
+# ====================================================================
+# Table detection helpers
+# ====================================================================
+
+def _is_table_row(line: str) -> bool:
+    """Check if a line looks like a table row (pipe-separated or tab-separated)."""
+    return '|' in line and line.count('|') >= 2
+
+
+def _parse_table_lines(lines: List[str]) -> Optional[List[List[str]]]:
+    """Parse pipe-separated or tab-separated lines into a table."""
+    if not lines or not _is_table_row(lines[0]):
+        return None
+    rows = []
+    for line in lines:
+        if _is_table_row(line):
+            cells = [c.strip() for c in line.split('|') if c.strip()]
+            if cells:
+                rows.append(cells)
+        elif not line.strip():
+            break
+        else:
+            break
+    return rows if len(rows) >= 2 else None
+
+
+# ====================================================================
+# Main generator
+# ====================================================================
+
+def generate_merged_docx(merge_plan, docs_data,
+                         all_images_by_doc, output_path,
+                         cover_title="",
+                         skeleton=None,
+                         template_path=None) -> str:
     doc = Document()
+
+    if skeleton:
+        _apply_template_styles(doc, skeleton)
 
     # Default font
     style = doc.styles['Normal']
     font = style.font
     font.name = '宋体'
-    font.size = Pt(11)
-    style.element.rPr.rFonts.set(qn('w:eastAsia'), '宋体')
+    font.size = Pt(10.5)
+    try:
+        style.element.rPr.rFonts.set(qn('w:eastAsia'), '宋体')
+    except Exception:
+        pass
 
     # Page margins
-    for section in doc.sections:
-        section.top_margin = Cm(2.5)
-        section.bottom_margin = Cm(2.5)
-        section.left_margin = Cm(2.8)
-        section.right_margin = Cm(2.8)
+    if skeleton and skeleton.page_layout and skeleton.page_layout.margin_top:
+        for s in doc.sections:
+            s.top_margin = skeleton.page_layout.margin_top
+            s.bottom_margin = skeleton.page_layout.margin_bottom
+            s.left_margin = skeleton.page_layout.margin_left
+            s.right_margin = skeleton.page_layout.margin_right
+    else:
+        for s in doc.sections:
+            s.top_margin = Cm(2.5)
+            s.bottom_margin = Cm(2.5)
+            s.left_margin = Cm(2.8)
+            s.right_margin = Cm(2.0)
 
-    filenames = [d["filename"] for d in docs_data]
+    # ================================================================
+    # 1. COVER
+    # ================================================================
+    final_title = merge_plan.cover_title or cover_title or "操作规程"
+    _clone_cover_from_template(doc, template_path, final_title)
 
-    # Build image lookup: dhash → actual blob
-    image_lookup = _build_image_lookup(all_images_by_doc)
-
-    # Track already-inserted dHashes to avoid duplicates across sections
-    inserted_hashes: set = set()
-
-    # === Cover ===
-    _create_cover(doc, len(filenames), filenames, cover_title)
-
-    # === TOC ===
+    # ================================================================
+    # 2. TOC
+    # ================================================================
     toc_headings = _collect_toc_headings(merge_plan, docs_data)
-    _generate_real_toc(doc, toc_headings)
+    _generate_text_toc(doc, toc_headings, merge_plan.main_sections, merge_plan.attachments)
 
-    # === Part 1: Common Content ===
-    _set_heading_style(doc, 1, "第一部分：共性内容")
+    # ================================================================
+    # 3. PREFACE — Heading 1, same level as body chapters
+    # ================================================================
+    _generate_preface(doc, template_path)
 
-    if merge_plan.common_sections:
-        for section in merge_plan.common_sections:
+    # ================================================================
+    # 4. BODY CHAPTERS — Heading 1, sub-sections Heading 2, sub-sub Heading 3
+    # ================================================================
+    if merge_plan.main_sections:
+        chapter_idx = 0
+        for section in merge_plan.main_sections:
             heading = section.get("heading", "")
-            level = section.get("level", 1)
             paragraphs = section.get("paragraphs", [])
             tables = section.get("tables", [])
-            images = section.get("images", [])
-            image_placement = section.get("image_placement", [])
 
-            if heading.startswith("_"):
+            if not heading or "前言" in heading or "目录" in heading:
                 continue
 
-            _set_heading_style(doc, min(level + 1, 9), heading)
+            clean_heading = re.sub(r'^[\d.、\s]+', '', heading).strip()
+            numbered = f"{chapter_idx + 1} {clean_heading}"
 
-            # Compute which images go after which paragraph
-            img_after_para: Dict[int, List[dict]] = {}
-            for img_info in images:
-                dh = img_info.get("dhash", "")
-                if dh in inserted_hashes:
-                    continue  # Already inserted in another section
-                actual = image_lookup.get(dh)
-                if not actual:
+            # Heading 1 for chapter title (same level as 前言)
+            _h1(doc, numbered)
+
+            # Write content with sub-section detection
+            for p_text in paragraphs:
+                if not p_text.strip():
                     continue
-                anchor = ""
-                for ip in image_placement:
-                    if ip.get("dhash", "") and dh.startswith(ip["dhash"][:8]):
-                        anchor = ip.get("anchor_text", "")
-                        if ip.get("caption"):
-                            actual["caption"] = ip["caption"]
-                        break
-                best_idx = _find_best_paragraph_index(
-                    paragraphs,
-                    anchor,
-                    img_info.get("context_before", ""),
-                    img_info.get("context_after", ""),
-                )
-                if best_idx not in img_after_para:
-                    img_after_para[best_idx] = []
-                # Generate caption
-                if not actual.get("caption"):
-                    ctx = img_info.get("context_before", "") or img_info.get("context_after", "")
-                    actual["caption"] = ctx[:40] if ctx else "图片"
-                img_after_para[best_idx].append(actual)
-                inserted_hashes.add(dh)
 
-            _write_paragraphs_with_images(doc, paragraphs, img_after_para)
-
-            for table_rows in tables:
-                _insert_table(doc, table_rows)
-    else:
-        _add_paragraph(doc, "（未检测到明确的共性内容）")
-
-    doc.add_page_break()
-
-    # === Part 2: Document-specific Content ===
-    _set_heading_style(doc, 1, "第二部分：各文档独有内容")
-
-    doc_names = list(merge_plan.doc_specific.keys())
-    for doc_name in doc_names:
-        sections = merge_plan.doc_specific.get(doc_name, [])
-        if not sections:
-            continue
-
-        _set_heading_style(doc, 2, f"来源文档：{doc_name}")
-
-        # Get actual image objects for this document
-        doc_images = all_images_by_doc.get(doc_name, [])
-        doc_img_lookup = {}
-        for img in doc_images:
-            dh = img.dhash if hasattr(img, 'dhash') else ""
-            if not dh:
-                try:
-                    from doc_parser import compute_dhash
-                    dh = compute_dhash(img.blob)
-                except Exception:
+                # Check if entire paragraph is a table
+                p_lines = p_text.strip().split('\n')
+                table_rows = _parse_table_lines(p_lines)
+                if table_rows:
+                    _table(doc, table_rows)
                     continue
-            doc_img_lookup[dh] = {
-                "blob": img.blob,
-                "content_type": img.content_type,
-                "dhash": dh,
-                "source_doc": doc_name,
-                "context_before": img.context_before if hasattr(img, 'context_before') else "",
-                "context_after": img.context_after if hasattr(img, 'context_after') else "",
-            }
 
-        for section in sections:
-            heading = section.get("heading", "")
-            level = section.get("level", 1)
-            paragraphs = section.get("paragraphs", [])
-            images = section.get("images", [])
+                for line in p_lines:
+                    line = line.strip()
+                    if not line:
+                        continue
 
-            if heading.startswith("_"):
-                continue
+                    # Detect heading patterns: "1.1 xxx", "1.1.1 xxx"
+                    sub2_match = re.match(r'^(\d+)\.(\d+)\s+(.+)', line)
+                    sub3_match = re.match(r'^(\d+)\.(\d+)\.(\d+)\s+(.+)', line)
 
-            _set_heading_style(doc, min(level + 2, 9), heading)
+                    if sub3_match:
+                        # Sub-sub-section → Heading 3
+                        c, s, ss, title = sub3_match.groups()
+                        new_line = f"{chapter_idx + 1}.{s}.{ss} {title}"
+                        _h3(doc, new_line)
+                    elif sub2_match:
+                        # Sub-section → Heading 2
+                        old_c, sub_n, title = sub2_match.groups()
+                        new_line = f"{chapter_idx + 1}.{sub_n} {title}"
+                        _h2(doc, new_line)
+                    elif re.match(r'^\d+[\.\、]', line):
+                        # Numbered list item → body text
+                        _body(doc, line)
+                    else:
+                        _body(doc, line)
 
-            # Compute image placement
-            img_after_para: Dict[int, List[dict]] = {}
-            for img_info in images:
-                dh = img_info.get("dhash", "")
-                if dh in inserted_hashes:
-                    continue
-                actual = image_lookup.get(dh) or doc_img_lookup.get(dh)
-                if not actual:
-                    continue
-                best_idx = _find_best_paragraph_index(
-                    paragraphs,
-                    "",
-                    img_info.get("context_before", ""),
-                    img_info.get("context_after", ""),
-                )
-                if best_idx not in img_after_para:
-                    img_after_para[best_idx] = []
-                if not actual.get("caption"):
-                    ctx = img_info.get("context_before", "") or img_info.get("context_after", "")
-                    actual["caption"] = ctx[:40] if ctx else f"图片（来源: {doc_name}）"
-                img_after_para[best_idx].append(actual)
-                inserted_hashes.add(dh)
+            # Dedicated tables from merge plan
+            for tbl_rows in tables:
+                _table(doc, tbl_rows)
 
-            _write_paragraphs_with_images(doc, paragraphs, img_after_para)
+            # Images
+            for img_info in section.get("images", []):
+                dhash = img_info.get("dhash", "")
+                for doc_name, img_list in all_images_by_doc.items():
+                    for img in img_list:
+                        if hasattr(img, 'dhash') and img.dhash == dhash:
+                            _add_image_to_doc(doc, img.blob, img.content_type,
+                                              caption=img_info.get("caption", ""))
+                            break
 
-            for table_rows in section.get("tables", []):
-                _insert_table(doc, table_rows)
+            doc.add_paragraph()
+            chapter_idx += 1
 
-        if doc_name != doc_names[-1]:
+    # ================================================================
+    # 5. APPENDICES
+    # ================================================================
+    if merge_plan.attachments:
+        for att in merge_plan.attachments:
             doc.add_page_break()
 
-    # Save
+            name = att.get("name", "附件")
+            paragraphs = att.get("paragraphs", [])
+
+            _h1(doc, name)
+            doc.add_paragraph()
+
+            for p_text in paragraphs:
+                if not p_text.strip():
+                    continue
+                cleaned = _clean_appendix_content(p_text.strip())
+
+                for chunk in cleaned.split("\n\n"):
+                    chunk = chunk.strip()
+                    if not chunk:
+                        continue
+
+                    for line in chunk.split("\n"):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        if line.startswith("【") and line.endswith("】"):
+                            inner = line.strip("【】")
+                            # Only make a heading if it looks like a REAL section heading:
+                            # - Not ending with sentence punctuation 。；！
+                            # - Not a long sentence (>20 chars, likely operational content)
+                            # - Not ending with a parenthetical note
+                            is_sentence_end = inner.endswith('。') or inner.endswith('；') or inner.endswith('！')
+                            is_long = len(inner) > 20
+                            is_operational = any(kw in inner for kw in ['打开', '关闭', '按下', '检查', '确认', '启动', '停止'])
+                            if not is_sentence_end and not is_long and not is_operational and len(inner) > 3:
+                                _h2(doc, inner)
+                            else:
+                                _body(doc, inner)
+                        else:
+                            _body(doc, line)
+
     doc.save(output_path)
     return output_path

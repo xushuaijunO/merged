@@ -1,6 +1,9 @@
-"""AI semantic analyzer: identifies common vs unique content across documents.
+"""AI semantic analyzer: template-driven document merging.
 
-Streaming-aware with progress callbacks for real-time UI updates.
+Pipeline:
+  1. Structure Planning — AI reads all docs + template chapters, plans body chapters + appendix mapping
+  2. Section Synthesis — AI generates each body chapter from all source docs concurrently
+  3. Attachments — Source doc content used directly (no AI regeneration)
 """
 
 import json
@@ -10,164 +13,33 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Callable
-from collections import defaultdict
 
 from config import (
     ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, MODEL,
     HTTP_VERIFY_SSL, HTTP_TRUST_ENV,
 )
+from template_parser import TemplateSkeleton, SectionNode
 
 logger = logging.getLogger("analyzer")
 
 
 @dataclass
 class MergePlan:
-    """Result of semantic analysis."""
-    common_sections: List[dict] = field(default_factory=list)
-    doc_specific: Dict[str, List[dict]] = field(default_factory=lambda: defaultdict(list))
+    """Result of template-driven analysis."""
+    main_sections: List[dict] = field(default_factory=list)
+    attachments: List[dict] = field(default_factory=list)
+    cover_title: str = ""
+    toc_headings: List[dict] = field(default_factory=list)
     summary: dict = field(default_factory=dict)
 
 
-def _heading_path(section: dict, parent_path: str = "") -> str:
-    """Build a full heading path for a section."""
-    current = f"{parent_path} > {section['heading']}" if parent_path else section['heading']
-    return current
-
-
-def flatten_sections(sections: List[dict], doc_name: str, parent_path: str = "") -> List[dict]:
-    """Flatten section tree into a list of (heading_path, content, doc_name) entries.
-
-    Now includes image metadata for AI-aware placement.
-    """
-    result = []
-    for sec in sections:
-        path = _heading_path(sec, parent_path)
-        entry = {
-            "heading_path": path,
-            "heading": sec["heading"],
-            "level": sec["level"],
-            "paragraphs": sec["paragraphs"],
-            "tables": sec["tables"],
-            "image_count": sec["image_count"],
-            "images": sec.get("images", []),  # Full image metadata
-            "doc_name": doc_name,
-            "children_count": len(sec.get("children", [])),
-        }
-        result.append(entry)
-        result.extend(flatten_sections(sec.get("children", []), doc_name, path))
-    return result
-
-
-def group_by_heading(all_entries: List[dict]) -> Dict[str, List[dict]]:
-    """Group flattened entries by heading path for cross-document comparison."""
-    groups = defaultdict(list)
-    for entry in all_entries:
-        groups[entry["heading_path"]].append(entry)
-    return dict(groups)
-
-
-def match_similar_headings(groups: Dict[str, List[dict]]) -> Dict[str, List[dict]]:
-    """Merge groups with similar (but not identical) heading paths."""
-    keys = list(groups.keys())
-    merged = {}
-    used = set()
-
-    for i, key1 in enumerate(keys):
-        if key1 in used:
-            continue
-        cluster = list(groups[key1])
-        for j, key2 in enumerate(keys):
-            if j <= i or key2 in used:
-                continue
-            parts1 = key1.split(" > ")
-            parts2 = key2.split(" > ")
-            if parts1[-1] == parts2[-1]:
-                cluster.extend(groups[key2])
-                used.add(key2)
-        merged[key1] = cluster
-        used.add(key1)
-
-    return merged
-
-
-def _build_analysis_prompt(heading_path: str, entries: List[dict]) -> str:
-    """Build the prompt for Claude to analyze a group of matching sections.
-
-    Now includes image metadata (dHash, positioning context) so the AI
-    can decide image placement and deduplication.
-    """
-    docs_content = []
-    for e in entries:
-        text = "\n".join(e["paragraphs"])
-        if not text:
-            text = "(空章节，仅有标题)"
-
-        # Build image annotations for this entry
-        images = e.get("images", [])
-        img_lines = []
-        if images:
-            img_lines.append(f"\n  📷 本章节包含 {len(images)} 张图片:")
-            for k, img in enumerate(images):
-                ctx_before = img.get("context_before", "")[:60]
-                ctx_after = img.get("context_after", "")[:60]
-                dhash_short = img.get("dhash", "")[:12]
-                img_lines.append(
-                    f"    图片{k+1}: dHash={dhash_short} "
-                    f"| 前文「{ctx_before}...」"
-                    f"| 后文「{ctx_after}...」"
-                )
-        docs_content.append(f"【{e['doc_name']}】\n{text}{''.join(img_lines)}")
-
-    combined = "\n\n---\n\n".join(docs_content)
-
-    doc_names = [e['doc_name'] for e in entries]
-    doc_names_str = "、".join(doc_names)
-    doc_keys_example = ",\n    ".join(f'"{n}": ["独有内容要点"]' for n in doc_names)
-
-    return f"""你是一个专业的文档合并专家。以下是 {len(entries)} 个文档中同一章节「{heading_path}」的内容。
-
-参与分析的文档：{doc_names_str}
-
-请分析这些内容：
-1. **共性内容**：语义相同或高度相似的部分，请融合为一段统一、通顺的表述
-2. **独有内容**：每个文档各自独有的内容。**关键：unique_by_doc 的 key 必须使用上面列出的文档名，不得使用"文档1""文档2"等代称。**
-3. **图片处理**：
-   - 如果多个图片的 dHash 前12位相同 → 它们是同一张图，只需保留一份
-   - 在 `image_placement` 中指定每张图片应插入到共性内容或独有内容的哪句话后面
-   - 为每张保留的图片生成一个简短的标题（10字以内），描述图片内容
-   - 标记重复图片为 `duplicate_of`，指向保留的那个图片
-
-注意：
-- 相似的表述应合并，不要简单拼接
-- 独有内容保持原文不变
-- 如果某文档该章节为空或仅有标题，标记为"无实质内容"
-- unique_by_doc 中无独有内容的文档也要列出，值设为空数组 []
-
-请严格按以下JSON格式输出（不要输出其他内容）：
-{{
-  "common": "融合后的共性内容",
-  "unique_by_doc": {{
-    {doc_keys_example}
-  }},
-  "image_placement": [
-    {{
-      "anchor_text": "要插入到哪句话后面（原文片段，20字以内）",
-      "target": "common 或 文档名（使用上面的实际文档名）",
-      "dhash": "图片的dHash值",
-      "caption": "图片标题（10字以内）",
-      "duplicate_of": null
-    }}
-  ]
-}}
-
-文档内容：
-{combined}"""
-
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _extract_json(text: str) -> dict:
-    """Robust JSON extraction from AI response that may contain markdown fences."""
+    """Robust JSON extraction from AI response."""
     text = text.strip()
-    # Remove markdown code fences
     if text.startswith("```"):
         lines = text.split("\n")
         if lines[0].startswith("```"):
@@ -175,337 +47,44 @@ def _extract_json(text: str) -> dict:
         if lines and lines[-1].startswith("```"):
             lines = lines[:-1]
         text = "\n".join(lines).strip()
-    # Try direct parse
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
-    # Try to find JSON block with regex
-    m = re.search(r'\{[\s\S]*"common"[\s\S]*"unique_by_doc"[\s\S]*\}', text)
+    m = re.search(r'\{[\s\S]*\}', text)
     if m:
         try:
             return json.loads(m.group(0))
         except json.JSONDecodeError:
             pass
-    # Last resort: try fixing common issues
+    cleaned = re.sub(r',\s*}', '}', text)
+    cleaned = re.sub(r',\s*]', ']', cleaned)
     try:
-        cleaned = re.sub(r',\s*}', '}', text)
-        cleaned = re.sub(r',\s*]', ']', cleaned)
         return json.loads(cleaned)
     except json.JSONDecodeError:
         raise
 
 
-def _call_claude_streaming(heading_path: str, entries: List[dict], progress_callback) -> dict:
-    """Call Claude API with streaming to capture thinking blocks."""
-    import anthropic
-    import httpx
+def _flatten_full_text(sections: List[dict]) -> str:
+    """Extract all text from sections recursively for AI prompts."""
+    parts = []
 
-    prompt = _build_analysis_prompt(heading_path, entries)
+    def _walk(secs):
+        for s in secs:
+            h = s.get("heading", "")
+            if h:
+                parts.append(f"【{h}】")
+            for p in s.get("paragraphs", []):
+                if p.strip():
+                    parts.append(p.strip())
+            _walk(s.get("children", []))
 
-    http_client = httpx.Client(verify=HTTP_VERIFY_SSL, trust_env=HTTP_TRUST_ENV)
-    client = anthropic.Anthropic(
-        api_key=ANTHROPIC_API_KEY,
-        base_url=ANTHROPIC_BASE_URL,
-        http_client=http_client,
-    )
-
-    try:
-        with client.messages.stream(
-            model=MODEL,
-            max_tokens=8192,
-            system="你是一个专业的文档合并与编辑助手。你的输出必须是合法的JSON格式。",
-            messages=[{"role": "user", "content": prompt}],
-        ) as stream:
-            response_text = ""
-            for event in stream:
-                if event.type == "content_block_delta":
-                    if event.delta.type == "text_delta":
-                        response_text += event.delta.text
-                    elif event.delta.type == "thinking_delta":
-                        if progress_callback:
-                            progress_callback("thinking", {
-                                "heading": heading_path,
-                                "thought": event.delta.thinking,
-                            })
-                elif event.type == "content_block_start":
-                    if event.content_block.type == "thinking":
-                        pass  # thinking block start
-            final = stream.get_final_message()
-            logger.info("AI API response | heading=%s | tokens_in=%d | tokens_out=%d",
-                        heading_path,
-                        final.usage.input_tokens if hasattr(final, 'usage') else 0,
-                        final.usage.output_tokens if hasattr(final, 'usage') else 0)
-    finally:
-        http_client.close()
-
-    if not response_text.strip():
-        raise ValueError("AI返回为空")
-
-    return _extract_json(response_text)
-
-
-def analyze_with_claude(heading_path: str, entries: List[dict],
-                        progress_callback: Optional[Callable] = None) -> dict:
-    """Call Claude API to analyze a section group, with retry logic and progress reporting.
-
-    Args:
-        heading_path: Full heading path being analyzed
-        entries: List of section entries from different documents
-        progress_callback: Optional fn(event_type, data_dict) for UI progress.
-            event_type: 'step_start' | 'thinking' | 'retry' | 'step_done' | 'step_error'
-
-    Returns:
-        dict with 'common', 'unique_by_doc' keys, plus optional 'error' flag
-    """
-    max_retries = 2
-
-    for attempt in range(max_retries + 1):
-        try:
-            if progress_callback and attempt == 0:
-                # Signal retry on subsequent attempts
-                pass
-
-            result = _call_claude_streaming(heading_path, entries, progress_callback)
-
-            # Validate expected keys
-            if "common" not in result and "unique_by_doc" not in result:
-                raise ValueError("响应缺少预期字段")
-
-            return result
-
-        except Exception as e:
-            logger.warning("AI analysis failed for '%s' (attempt %d/%d): %s",
-                           heading_path, attempt + 1, max_retries + 1, str(e))
-
-            if attempt < max_retries:
-                if progress_callback:
-                    progress_callback("retry", {
-                        "heading": heading_path,
-                        "attempt": attempt + 1,
-                        "reason": str(e)[:100],
-                    })
-            else:
-                if progress_callback:
-                    progress_callback("step_error", {
-                        "heading": heading_path,
-                        "error": str(e)[:100],
-                    })
-                return {
-                    "common": "",
-                    "unique_by_doc": {e2["doc_name"]: ["(AI分析失败，保留原文)"] for e2 in entries},
-                    "error": True,
-                }
-
-
-def structural_only_analysis(groups: Dict[str, List[dict]],
-                             progress_callback: Optional[Callable] = None) -> MergePlan:
-    """Fallback: structural matching without AI (no API key)."""
-    all_docs = set()
-    for entries in groups.values():
-        for e in entries:
-            all_docs.add(e["doc_name"])
-    doc_count = len(all_docs)
-
-    plan = MergePlan()
-    total = len(groups)
-    completed = 0
-
-    for heading_path, entries in groups.items():
-        docs_in_group = {e["doc_name"] for e in entries}
-
-        if progress_callback:
-            completed += 1
-            progress_callback("step_start", {
-                "heading": heading_path, "current": completed, "total": total,
-            })
-
-        if len(docs_in_group) == doc_count:
-            combined_text = []
-            all_section_images = []
-            for e in entries:
-                if e["paragraphs"]:
-                    combined_text.append(f"（来源：{e['doc_name']}）")
-                    combined_text.extend(e["paragraphs"])
-                # Collect all images from this heading group
-                all_section_images.extend(e.get("images", []))
-            # Deduplicate images by dHash
-            from doc_parser import hamming_distance
-            deduped_images = _dedup_images_by_hash(all_section_images)
-            plan.common_sections.append({
-                "heading": heading_path.split(" > ")[-1],
-                "level": entries[0]["level"],
-                "paragraphs": combined_text,
-                "tables": entries[0].get("tables", []),
-                "image_count": len(deduped_images),
-                "images": deduped_images,  # Deduplicated image list
-            })
-        else:
-            for e in entries:
-                if e["paragraphs"] or e["tables"]:
-                    plan.doc_specific[e["doc_name"]].append({
-                        "heading": heading_path.split(" > ")[-1],
-                        "level": e["level"],
-                        "paragraphs": e["paragraphs"],
-                        "tables": e.get("tables", []),
-                        "image_count": e.get("image_count", 0),
-                        "images": e.get("images", []),
-                    })
-
-        if progress_callback:
-            progress_callback("step_done", {
-                "heading": heading_path, "current": completed, "total": total,
-            })
-
-    plan.summary = {
-        "common_sections": len(plan.common_sections),
-        "doc_specific_total": sum(len(v) for v in plan.doc_specific.values()),
-        "mode": "structural_only",
-    }
-    return plan
-
-
-def _process_ai_result(heading_path: str, entries: List[dict], result: dict,
-                       plan: MergePlan):
-    """Process a single AI analysis result and populate the merge plan."""
-    common_text = result.get("common", "")
-    image_placement = result.get("image_placement", [])
-
-    if common_text and common_text != "无":
-        all_section_images = []
-        for e in entries:
-            all_section_images.extend(e.get("images", []))
-        deduped_images = _dedup_images_by_hash(all_section_images)
-        plan.common_sections.append({
-            "heading": heading_path.split(" > ")[-1],
-            "full_path": heading_path,
-            "level": entries[0]["level"],
-            "paragraphs": [common_text],
-            "tables": entries[0].get("tables", []),
-            "image_count": len(deduped_images),
-            "images": deduped_images,
-            "image_placement": image_placement,
-        })
-
-    unique_by_doc = result.get("unique_by_doc", {})
-    # Build a mapping from generic "文档N" keys to actual doc names
-    unique_docs = list(dict.fromkeys(e["doc_name"] for e in entries))
-    generic_to_real = {f"文档{i+1}": name for i, name in enumerate(unique_docs)}
-
-    for doc_name, items in unique_by_doc.items():
-        if items and len(items) > 0:
-            # Map generic AI-generated key to actual filename
-            actual_name = generic_to_real.get(doc_name, doc_name)
-            entry_images = []
-            for e in entries:
-                if e["doc_name"] == actual_name:
-                    entry_images = e.get("images", [])
-                    break
-            plan.doc_specific[actual_name].append({
-                "heading": f"{heading_path.split(' > ')[-1]}（独有）",
-                "level": entries[0]["level"] + 1,
-                "paragraphs": items if isinstance(items[0], str) else [str(i) for i in items],
-                "tables": [],
-                "image_count": len(entry_images),
-                "images": entry_images,
-            })
-
-
-def ai_analysis(groups: Dict[str, List[dict]],
-                progress_callback: Optional[Callable] = None) -> MergePlan:
-    """Full AI-powered analysis using Claude API with concurrent execution.
-
-    Single-doc groups are processed immediately (no AI needed).
-    Multi-doc groups are submitted to a thread pool for parallel AI analysis.
-
-    Args:
-        groups: Heading groups keyed by path
-        progress_callback: fn(event_type, data) for real-time UI updates
-    """
-    plan = MergePlan()
-    total = len(groups)
-    completed = 0
-    lock = threading.Lock()
-
-    # Phase 1: process single-doc groups immediately, collect AI tasks
-    ai_tasks = []
-    for heading_path, entries in groups.items():
-        docs_in_group = {e["doc_name"] for e in entries}
-        if len(docs_in_group) == 1:
-            e = entries[0]
-            if e["paragraphs"] or e["tables"] or e.get("images"):
-                plan.doc_specific[e["doc_name"]].append({
-                    "heading": heading_path.split(" > ")[-1],
-                    "level": e["level"],
-                    "paragraphs": e["paragraphs"],
-                    "tables": e.get("tables", []),
-                    "image_count": e.get("image_count", 0),
-                    "images": e.get("images", []),
-                })
-            with lock:
-                completed += 1
-            if progress_callback:
-                progress_callback("step_done", {
-                    "heading": heading_path, "current": completed, "total": total,
-                })
-        else:
-            ai_tasks.append((heading_path, entries))
-
-    # Phase 2: concurrent AI analysis for multi-doc groups
-    if ai_tasks:
-        # Signal all AI step starts at once
-        for heading_path, _entries in ai_tasks:
-            if progress_callback:
-                progress_callback("step_start", {
-                    "heading": heading_path, "current": completed, "total": total,
-                })
-
-        def analyze_one(hp, ents):
-            try:
-                result = analyze_with_claude(hp, ents, progress_callback)
-                return hp, ents, result, None
-            except Exception as exc:
-                logger.error("AI analysis fatal error for '%s': %s", hp, str(exc))
-                return hp, ents, None, str(exc)
-
-        max_workers = min(5, len(ai_tasks))
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(analyze_one, hp, e): hp for hp, e in ai_tasks}
-            for future in as_completed(futures):
-                hp, ents, result, error = future.result()
-                with lock:
-                    completed += 1
-                if error:
-                    if progress_callback:
-                        progress_callback("step_error", {
-                            "heading": hp, "error": error[:100],
-                        })
-                    for entry in ents:
-                        plan.doc_specific[entry["doc_name"]].append({
-                            "heading": hp.split(" > ")[-1],
-                            "level": entry["level"],
-                            "paragraphs": entry["paragraphs"],
-                            "tables": entry.get("tables", []),
-                            "image_count": entry.get("image_count", 0),
-                            "images": entry.get("images", []),
-                        })
-                else:
-                    _process_ai_result(hp, ents, result, plan)
-                if progress_callback:
-                    progress_callback("step_done", {
-                        "heading": hp, "current": completed, "total": total,
-                    })
-
-    plan.summary = {
-        "common_sections": len(plan.common_sections),
-        "doc_specific_total": sum(len(v) for v in plan.doc_specific.values()),
-        "mode": "ai_analysis",
-    }
-    return plan
+    _walk(sections)
+    return "\n\n".join(parts)
 
 
 def _dedup_images_by_hash(images: List[dict], threshold: int = 5) -> List[dict]:
-    """Deduplicate images by dHash Hamming distance. Keeps largest (best quality)."""
+    """Deduplicate images by dHash Hamming distance."""
     if not images:
         return []
     from doc_parser import hamming_distance
@@ -522,32 +101,483 @@ def _dedup_images_by_hash(images: List[dict], threshold: int = 5) -> List[dict]:
                 new_remaining.append(img)
         remaining = new_remaining
         group.sort(key=lambda x: x.get("size_bytes", 0), reverse=True)
-        result.append(group[0])  # Keep the largest/best quality
+        result.append(group[0])
     return result
 
 
+# ---------------------------------------------------------------------------
+# Phase 1: Structure Planning
+# ---------------------------------------------------------------------------
+
+def _build_structure_plan_prompt(template_sections: List[SectionNode],
+                                  doc_summaries: List[dict],
+                                  has_template: bool) -> str:
+    """Build prompt for AI to plan the output document structure."""
+
+    if has_template:
+        # Filter to only body chapters (exclude cover, TOC, appendix headings)
+        body_sections = []
+        for s in template_sections:
+            heading = s.heading.strip()
+            if heading.startswith("附件") or heading.startswith("附录"):
+                continue
+            if "目录" in heading or "目次" in heading:
+                continue
+            if s.style_name in ("封面标准名称", "封面标准号2", "其他标准标志",
+                                 "其他标准称谓", "其他发布日期", "其他实施日期"):
+                continue
+            body_sections.append(s)
+
+        chapter_desc = []
+        for s in body_sections:
+            indent = "  " * s.level
+            chapter_desc.append(f"{indent}[H{s.level}] {s.heading}")
+        chapter_text = "\n".join(chapter_desc) if chapter_desc else "（模板无明确正文标题，请根据源文件内容自行确定）"
+
+        template_instruction = f"""## 模板章节结构（严格遵循，不得增减）
+
+以下是模板的正文标题。main_sections 必须恰好是以下 {len(body_sections)} 个标题，不得增加、减少或改变顺序：
+
+{chapter_text}
+
+重要：不要额外添加如"车间化验""上位机操作""机泵操作""加药系统操作""深度处理系统运行""污泥处理系统运行"等章节。这些内容应作为"作业要求"章节下的子节处理。"""
+    else:
+        template_instruction = """## 无模板
+
+请通读所有源文件的内容概要，自行归纳出统一的章节标题体系。通常是企业操作规程的标准结构（范围、规范性引用文件、职责、风险辨识、上岗条件、作业要求、应急处置等），但具体标题必须根据源文件实际内容来确定，不要生搬硬套。"""
+
+    src_desc = []
+    for i, s in enumerate(doc_summaries):
+        src_desc.append(
+            f"{i+1}. **{s['filename']}** ({s.get('paragraph_count', 0)}段, "
+            f"{s.get('heading_count', 0)}个标题)\n"
+            f"   主要标题: {'; '.join(s.get('top_headings', [])[:6])}\n"
+            f"   内容概要: {s.get('summary', '')[:200]}"
+        )
+    src_text = "\n".join(src_desc)
+
+    return f"""你是一个专业的企业文档编辑。请规划合并文档的结构。
+
+{template_instruction}
+
+## 源文件 ({len(doc_summaries)}个)
+{src_text}
+
+## 任务
+
+规划最终统一操作规程的结构。这是一个凝练整合的过程，不是简单拼接：
+
+1. **主文档正文**：从所有源文件中综合提炼共性的、概括性的内容，按模板章节组织为统一的正文章节。写作风格参考企业操作规程：简洁、专业、原则性表述。
+2. **附件**：每个源文件对应一个附件，附件名使用"附件A：源文件文档名"、"附件B：源文件文档名"等格式。附件保留各源文件的详细操作步骤。
+3. **不重复原则**：主文档已有的概括性内容，附件中不再赘述。主文档通过"具体操作参照《附件X：XXX》"引用附件。
+4. **无"来源文档"标识**：主文档中不出现"来源文档：XXX"等字样。
+5. **无"共性/独有"标识**：文档是一个统一的操作规程，不区分共性独有。
+
+请严格输出以下JSON格式（不要输出其他任何内容）：
+{{
+  "cover_title": "统一操作规程的标题",
+  "main_sections": [
+    {{"heading": "第1章标题", "level": 1, "style_name": "Heading 2"}},
+    {{"heading": "第2章标题", "level": 1, "style_name": "Heading 2"}}
+  ],
+  "attachments": [
+    {{"name": "附件A：源文件1的标题", "source_index": 0}},
+    {{"name": "附件B：源文件2的标题", "source_index": 1}}
+  ],
+  "toc_headings": [
+    {{"level": 1, "text": "前言"}},
+    {{"level": 2, "text": "1 范围"}},
+    {{"level": 2, "text": "2 规范性引用文件"}}
+  ]
+}}"""
+
+
+def plan_structure(template_sections: List[SectionNode],
+                   doc_summaries: List[dict],
+                   has_template: bool,
+                   progress_callback: Optional[Callable] = None) -> dict:
+    """Phase 1: AI plans the output document structure."""
+    import anthropic
+    import httpx
+
+    if progress_callback:
+        progress_callback("progress", {
+            "stage": "planning",
+            "message": "AI 正在分析文档并规划结构...",
+            "percent": 25,
+        })
+
+    prompt = _build_structure_plan_prompt(template_sections, doc_summaries, has_template)
+
+    http_client = httpx.Client(verify=HTTP_VERIFY_SSL, trust_env=HTTP_TRUST_ENV)
+    client = anthropic.Anthropic(
+        api_key=ANTHROPIC_API_KEY,
+        base_url=ANTHROPIC_BASE_URL,
+        http_client=http_client,
+    )
+
+    try:
+        with client.messages.stream(
+            model=MODEL,
+            max_tokens=8192,
+            system="你是一个专业的企业文档编辑。输出必须是合法的完整JSON格式，每个标题只出现一次，不要重复。",
+            messages=[{"role": "user", "content": prompt}],
+        ) as stream:
+            response_text = ""
+            for event in stream:
+                if event.type == "content_block_delta":
+                    if event.delta.type == "text_delta":
+                        response_text += event.delta.text
+
+        if not response_text.strip():
+            raise ValueError("AI returned empty response for structure planning")
+
+        result = _extract_json(response_text)
+        # Deduplicate main_sections by heading
+        seen = set()
+        unique_sections = []
+        for s in result.get("main_sections", []):
+            h = s.get("heading", "")
+            if h and h not in seen:
+                seen.add(h)
+                unique_sections.append(s)
+        result["main_sections"] = unique_sections
+        logger.info("Structure plan: %d main sections, %d attachments",
+                     len(result.get("main_sections", [])),
+                     len(result.get("attachments", [])))
+        return result
+
+    finally:
+        http_client.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: Section Synthesis
+# ---------------------------------------------------------------------------
+
+def _build_section_synthesis_prompt(heading: str, all_source_texts: List[dict],
+                                     attachment_names: List[str]) -> str:
+    """Build prompt for synthesizing one body chapter from all source docs."""
+    sources_text = []
+    for s in all_source_texts:
+        sources_text.append(
+            f"### 源文件：{s['filename']}\n{s['full_text'][:4000]}"
+            f"{'...(内容截断)' if len(s.get('full_text', '')) > 4000 else ''}"
+        )
+    combined = "\n\n---\n\n".join(sources_text)
+
+    att_refs = "\n".join(f"- 《{a}》" for a in attachment_names) if attachment_names else "（无）"
+
+    return f"""你是一个专业的企业文档编辑。请为统一操作规程撰写「{heading}」章节的内容。
+
+## 任务
+综合以下 {len(all_source_texts)} 个源文件的内容，撰写一个统一的「{heading}」章节。
+
+撰写要求：
+- 提取所有源文件中与「{heading}」相关的内容，融合为通顺、精炼的表述
+- 只写概括性、原则性的内容，不写详细的分步操作步骤
+- 如果某操作有详细步骤在附件中，引用附件：如"具体操作参照《附件A：XXX》"
+- **使用编号的子标题**：如果该章节下有多个子主题，使用"6.1 xxx"、"6.2 xxx"等编号格式
+- **内容用列表组织**：子标题下的内容尽量用"1. xxx\n2. xxx\n3. xxx"的编号列表形式逐条列出，清晰易读
+- **适合表格的内容用表格**：如果内容是规格参数、对比信息、清单类数据，用"| 列1 | 列2 |"的markdown表格格式输出
+- **不要给章节标题本身加编号**（标题编号由系统自动添加），直接写正文内容
+- 保持企业标准文档的专业、简洁风格
+- 不要标注"共性"、"独有"等字样
+- 不要标注"来源文档"等字样
+- 使用中文
+
+## 可引用的附件
+{att_refs}
+
+## 源文件内容
+{combined}
+
+请直接输出该章节的正文内容（纯文本段落，可用编号列表如1. 2. 3.和子标题如6.1、6.2，可用|表格|，不要JSON格式）。"""
+
+
+def _synthesize_section(heading: str, all_source_texts: List[dict],
+                         attachment_names: List[str],
+                         progress_callback=None) -> dict:
+    """Phase 2: AI synthesizes one body chapter from all source docs."""
+    import anthropic
+    import httpx
+
+    prompt = _build_section_synthesis_prompt(heading, all_source_texts, attachment_names)
+
+    http_client = httpx.Client(verify=HTTP_VERIFY_SSL, trust_env=HTTP_TRUST_ENV)
+    client = anthropic.Anthropic(
+        api_key=ANTHROPIC_API_KEY,
+        base_url=ANTHROPIC_BASE_URL,
+        http_client=http_client,
+    )
+
+    try:
+        with client.messages.stream(
+            model=MODEL,
+            max_tokens=4096,
+            system="你是一个专业的企业文档编辑。输出简洁、通顺的中文段落，不要JSON格式。",
+            messages=[{"role": "user", "content": prompt}],
+        ) as stream:
+            response_text = ""
+            for event in stream:
+                if event.type == "content_block_delta":
+                    if event.delta.type == "text_delta":
+                        response_text += event.delta.text
+
+        paragraphs = [p.strip() for p in response_text.strip().split("\n\n") if p.strip()]
+
+        return {
+            "heading": heading,
+            "paragraphs": paragraphs,
+            "tables": [],
+            "images": [],
+        }
+    finally:
+        http_client.close()
+
+
+# ---------------------------------------------------------------------------
+# Fallback
+# ---------------------------------------------------------------------------
+
+def _fallback_plan(doc_summaries: List[dict]) -> dict:
+    """Fallback when AI structure planning fails."""
+    return {
+        "cover_title": "操作规程汇编",
+        "main_sections": [
+            {"heading": "前言", "level": 1, "style_name": "前言、引言标题"},
+        ],
+        "attachments": [
+            {
+                "name": f"附件{chr(65 + i)}：{_clean_filename_for_attachment(s['filename'])}",
+                "source_index": i,
+            }
+            for i, s in enumerate(doc_summaries)
+        ],
+        "toc_headings": [
+            {"level": 1, "text": "前言"},
+        ],
+    }
+
+
+def _clean_filename_for_attachment(filename: str) -> str:
+    """Extract a clean title from a source filename."""
+    name = filename.replace('.docx', '').replace('.DOCX', '')
+    # Remove doc number patterns like SCW-V-C038-PD-2025
+    name = re.sub(r'[A-Z]+-V-C\d+-PD-\d{4}\s*', '', name)
+    name = name.strip()
+    return name or filename
+
+
+def _clean_attachment_name(raw_name: str, filename: str) -> str:
+    """Clean attachment name: remove .docx, doc numbers like SCW-V-C038-PD-2025."""
+    name = raw_name.strip()
+    # Remove .docx suffix
+    name = re.sub(r'\.docx$', '', name, flags=re.IGNORECASE)
+    # Remove doc number patterns: XX-V-CXXX-PD-XXXX
+    name = re.sub(r'[A-Z]+-V-C\d+-PD-\d{4}\s*', '', name)
+    # Remove leading numbers and dots
+    name = re.sub(r'^[\d\.、\s]+', '', name)
+    # Remove trailing spaces
+    name = name.strip()
+    # Ensure it starts with 附件 + letter
+    if not name.startswith("附件"):
+        name = f"附件{chr(65 + _attachment_counter())}：{name or filename.replace('.docx', '')}"
+    return name
+
+
+_attach_counter = 0
+
+
+def _attachment_counter():
+    global _attach_counter
+    _attach_counter += 1
+    return _attach_counter - 1
+
+
+def _build_doc_summaries(docs_data: List[dict]) -> List[dict]:
+    """Build summaries of each source doc for Phase 1 structure planning."""
+    summaries = []
+    for doc in docs_data:
+        sections = doc.get("sections", [])
+        all_headings = []
+        total_paras = 0
+        for s in sections:
+            if s.get("heading"):
+                all_headings.append(s["heading"])
+            total_paras += len(s.get("paragraphs", []))
+            for c in s.get("children", []):
+                if c.get("heading"):
+                    all_headings.append(c["heading"])
+                total_paras += len(c.get("paragraphs", []))
+
+        first_paras = []
+        for s in sections[:2]:
+            first_paras.extend(s.get("paragraphs", [])[:3])
+        summary = " ".join(first_paras)[:200]
+
+        summaries.append({
+            "filename": doc.get("filename", ""),
+            "paragraph_count": total_paras,
+            "heading_count": len(all_headings),
+            "top_headings": [s.get("heading", "") for s in sections[:8] if s.get("heading")],
+            "summary": summary,
+        })
+    return summaries
+
+
+# ---------------------------------------------------------------------------
+# Main Entry Point
+# ---------------------------------------------------------------------------
+
 def analyze_documents(docs_data: List[dict],
+                      template_sections: List[SectionNode] = None,
                       progress_callback: Optional[Callable] = None) -> MergePlan:
-    """Main entry point: analyze multiple parsed documents.
+    """Template-driven merge analysis.
 
     Args:
-        docs_data: List of dicts from ParsedDocument.to_dict()
-        progress_callback: Optional fn(event_type, data_dict) for UI progress
+        docs_data: List of ParsedDocument.to_dict() results
+        template_sections: Template chapter structure (from template_parser).
+                          None or empty = AI derives chapters from source docs.
+        progress_callback: Optional fn(event_type, data_dict) for UI updates
 
     Returns:
-        MergePlan with common and doc-specific sections
+        MergePlan with main_sections (AI-synthesized body) and attachments (raw source docs)
     """
-    all_entries = []
-    for doc in docs_data:
-        entries = flatten_sections(doc["sections"], doc["filename"])
-        all_entries.extend(entries)
+    if progress_callback:
+        progress_callback("progress", {
+            "stage": "preparing",
+            "message": "准备分析...",
+            "percent": 10,
+        })
 
-    raw_groups = group_by_heading(all_entries)
-    groups = match_similar_headings(raw_groups)
+    has_template = bool(template_sections)
+    doc_summaries = _build_doc_summaries(docs_data)
 
+    # Phase 1: Plan structure
     if ANTHROPIC_API_KEY:
-        logger.info("Using AI analysis mode | model=%s | groups=%d", MODEL, len(groups))
-        return ai_analysis(groups, progress_callback)
+        try:
+            structure_plan = plan_structure(
+                template_sections or [], doc_summaries, has_template, progress_callback,
+            )
+        except Exception as e:
+            logger.error("Structure planning failed: %s, using fallback", e)
+            structure_plan = _fallback_plan(doc_summaries)
     else:
-        logger.warning("API key not set, falling back to structural-only analysis")
-        return structural_only_analysis(groups, progress_callback)
+        structure_plan = _fallback_plan(doc_summaries)
+
+    # Build full text dicts for Phase 2
+    doc_texts = []
+    for doc in docs_data:
+        sections = doc.get("sections", [])
+        full = _flatten_full_text(sections)
+        doc_texts.append({
+            "filename": doc.get("filename", ""),
+            "full_text": full,
+        })
+
+    plan = MergePlan()
+    plan.cover_title = structure_plan.get("cover_title", "")
+    plan.toc_headings = structure_plan.get("toc_headings", [])
+
+    main_plan = structure_plan.get("main_sections", [])
+    attach_plan = structure_plan.get("attachments", [])
+
+    if progress_callback:
+        progress_callback("progress", {
+            "stage": "generating",
+            "message": f"AI 正在生成主文档内容 ({len(main_plan)}个章节)...",
+            "percent": 35,
+        })
+
+    # Phase 2a: Synthesize body chapters concurrently
+    lock = threading.Lock()
+    completed = 0
+    total_main = len(main_plan)
+
+    attachment_names = [a.get("name", "") for a in attach_plan]
+
+    if main_plan and ANTHROPIC_API_KEY:
+        # Preserve original order: map heading → original index
+        heading_order = {s.get("heading", ""): i for i, s in enumerate(main_plan)}
+
+        def gen_main(sec_info):
+            return _synthesize_section(
+                sec_info.get("heading", ""),
+                doc_texts,
+                attachment_names,
+                progress_callback,
+            )
+
+        results_by_heading = {}
+        max_w = min(3, len(main_plan))
+        with ThreadPoolExecutor(max_workers=max_w) as executor:
+            futures = {executor.submit(gen_main, s): s for s in main_plan}
+            for future in as_completed(futures):
+                result = future.result()
+                with lock:
+                    completed += 1
+                    results_by_heading[result.get("heading", "")] = result
+                    if progress_callback:
+                        progress_callback("progress", {
+                            "stage": "generating",
+                            "message": f"主文档生成 ({completed}/{total_main}): {result.get('heading', '')}",
+                            "percent": 35 + int(30 * completed / max(total_main, 1)),
+                        })
+
+        # Sort results by original plan order
+        plan.main_sections = sorted(
+            results_by_heading.values(),
+            key=lambda r: heading_order.get(r.get("heading", ""), 999),
+        )
+    elif main_plan:
+        # No API key: use empty sections from plan
+        for sec in main_plan:
+            plan.main_sections.append({
+                "heading": sec.get("heading", ""),
+                "paragraphs": ["（需要AI分析，请配置API Key）"],
+                "tables": [],
+                "images": [],
+            })
+
+    # Phase 2b: Attachments — use source doc content directly (no AI regeneration)
+    # Each source doc maps to one appendix
+    for att_info in attach_plan:
+        src_idx = att_info.get("source_index", -1)
+        if 0 <= src_idx < len(docs_data):
+            src_doc = docs_data[src_idx]
+            att_text = _flatten_full_text(src_doc.get("sections", []))
+            # Clean attachment name: remove .docx, doc numbers, extra prefixes
+            raw_name = att_info.get("name", f"附件{chr(65 + src_idx)}")
+            clean_name = _clean_attachment_name(raw_name, src_doc.get("filename", ""))
+            plan.attachments.append({
+                "name": clean_name,
+                "paragraphs": [att_text],
+                "level": 1,
+                "source_index": src_idx,
+            })
+        with lock:
+            completed += 1
+            if progress_callback:
+                progress_callback("progress", {
+                    "stage": "generating",
+                    "message": f"附件处理 ({completed + total_main}/{total_main + len(attach_plan)}): {att_info.get('name', '')}",
+                    "percent": 35 + int(30 * (completed + total_main) / max(total_main + len(attach_plan), 1)),
+                })
+
+    plan.summary = {
+        "main_sections": len(plan.main_sections),
+        "attachments": len(plan.attachments),
+        "total_docs": len(docs_data),
+        "mode": "template_driven" if has_template else "ai_derived",
+        "cover_title": plan.cover_title,
+    }
+
+    if progress_callback:
+        progress_callback("progress", {
+            "stage": "generated",
+            "message": "内容生成完成",
+            "percent": 65,
+        })
+
+    return plan
