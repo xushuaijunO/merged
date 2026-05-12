@@ -157,6 +157,24 @@ class MergeAgent:
     def get_session(self, session_id: str) -> Optional[dict]:
         return self.sessions.get(session_id)
 
+    @staticmethod
+    def _source_docs(session: dict) -> List:
+        """Parsed docs minus the one designated as template."""
+        template_filename = session.get("template_filename", "")
+        parsed = session.get("parsed_docs") or []
+        if not template_filename:
+            return list(parsed)
+        return [d for d in parsed if d.filename != template_filename]
+
+    @staticmethod
+    def _source_images(session: dict) -> Dict:
+        """all_images minus the template file's images."""
+        template_filename = session.get("template_filename", "")
+        all_images = session.get("all_images") or {}
+        if not template_filename:
+            return dict(all_images)
+        return {k: v for k, v in all_images.items() if k != template_filename}
+
     async def handle_message(
         self, session_id: str, user_message: str
     ) -> AsyncGenerator[str, None]:
@@ -515,10 +533,10 @@ class MergeAgent:
             return {"data": detail, "_sse_events": []}
 
         elif tool_name == "analyze_commonality":
-            parsed = session["parsed_docs"]
+            parsed = self._source_docs(session)
             if len(parsed) < 2:
                 return {
-                    "data": {"error": f"至少需要2个已解析文档，当前只有{len(parsed)}个"},
+                    "data": {"error": f"至少需要2个非模板源文档，当前只有{len(parsed)}个"},
                     "_sse_events": [],
                 }
 
@@ -587,7 +605,7 @@ class MergeAgent:
 
         elif tool_name == "generate_merged_document":
             merge_plan = session.get("merge_plan")
-            parsed = session.get("parsed_docs")
+            parsed = self._source_docs(session)
 
             if not merge_plan:
                 return {
@@ -661,7 +679,7 @@ class MergeAgent:
                 generate_merged_docx,
                 merge_plan,
                 docs_data,
-                session.get("all_images", {}),
+                self._source_images(session),
                 output_path,
                 cover_title,
                 skeleton,
@@ -805,6 +823,16 @@ class MergeAgent:
         session["parsed_docs"] = parsed_docs
         session["all_images"] = all_images
 
+        # Apply template filter for downstream processing
+        source_parsed = [d for d in parsed_docs if d.filename != session.get("template_filename", "")]
+        source_images = {k: v for k, v in all_images.items() if k != session.get("template_filename", "")}
+
+        if len(source_parsed) < 2:
+            yield self._sse("message", {
+                "text": f"剔除模板后只剩 {len(source_parsed)} 个源文档，至少需要2个。",
+            })
+            return
+
         # Check for template
         template_sections = None
         template_path = session.get("template_path")
@@ -818,7 +846,7 @@ class MergeAgent:
 
         docs_info = "\n".join(
             f"- **{p.filename}**：{len(p.sections)}个章节，{len(p.all_images)}张图片，{len(p.all_tables)}个表格"
-            for p in parsed_docs
+            for p in source_parsed
         )
         yield self._sse("message", {"text": f"✅ 解析完成：\n\n{docs_info}\n\n正在AI语义分析..."})
 
@@ -830,7 +858,7 @@ class MergeAgent:
             except Exception:
                 pass
 
-        docs_data = [d.to_dict() for d in parsed_docs]
+        docs_data = [d.to_dict() for d in source_parsed]
         loop = asyncio.get_event_loop()
 
         async def run_analysis():
@@ -884,7 +912,7 @@ class MergeAgent:
         output_filename = f"merged_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
         output_path = os.path.join(UPLOAD_DIR, output_filename)
         await loop.run_in_executor(
-            None, generate_merged_docx, merge_plan, docs_data, all_images, output_path,
+            None, generate_merged_docx, merge_plan, docs_data, source_images, output_path,
             merge_plan.cover_title, skeleton, template_path,
         )
 

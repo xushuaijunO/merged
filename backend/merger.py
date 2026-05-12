@@ -9,15 +9,16 @@ Heading hierarchy (all black, visible in Word navigation pane):
 import os
 import io as std_io
 import re
+import shutil
 from typing import List, Dict, Optional
 from docx import Document
 from docx.shared import Inches, Pt, RGBColor, Cm
-from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_LEADER
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.style import WD_STYLE_TYPE
 from docx.oxml.ns import qn
 
 from analyzer import MergePlan
 
-LINES_PER_PAGE = 28
 BLACK = RGBColor(0, 0, 0)
 
 
@@ -61,10 +62,27 @@ def _h3(doc, text):
     return h
 
 
+def _h4(doc, text):
+    """Heading 4: deepest sub-sections like 1.1.1.1 (used in appendix only)."""
+    h = doc.add_heading(_strip_markdown(text), level=4)
+    for run in h.runs:
+        run.font.color.rgb = BLACK
+        run.font.name = "黑体"
+    return h
+
+
 def _body(doc, text):
-    """Normal body paragraph (宋体 10.5pt)."""
+    """Normal body paragraph (宋体 10.5pt).
+
+    Automatically strips leading heading-numbering patterns (e.g. "1.1 内容")
+    from body paragraphs — these are often source-doc numbering that slipped
+    into the AI-generated text.
+    """
+    cleaned = _strip_markdown(text)
+    # Strip "N.M content" / "N.M.K content" etc. from the start of body text
+    cleaned = re.sub(r'^\d+(?:\.\d+)+\s+', '', cleaned).strip()
     p = doc.add_paragraph()
-    run = p.add_run(_strip_markdown(text))
+    run = p.add_run(cleaned)
     run.font.size = Pt(10.5)
     run.font.name = "宋体"
     run.font.color.rgb = BLACK
@@ -94,119 +112,192 @@ def _table(doc, rows: List[List[str]]):
 def _add_image_to_doc(doc, image_blob, content_type, caption="", width_inches=5.0):
     image_stream = std_io.BytesIO(image_blob)
     try:
+        doc.add_picture(image_stream, width=Inches(width_inches))
+        doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
         if caption:
             cap = doc.add_paragraph()
             cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            cap.add_run(f"【图】{caption}")
-        doc.add_picture(image_stream, width=Inches(width_inches))
-        doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
+            run = cap.add_run(caption)
+            run.font.size = Pt(9)
+            run.font.name = "宋体"
+            run.font.color.rgb = BLACK
+            run.italic = True
     except Exception:
         pass
 
 
 # ====================================================================
-# Template styles
+# Template-as-base cover preservation
 # ====================================================================
 
-def _apply_template_styles(doc, skeleton):
-    if not skeleton or not skeleton.styles:
+# Boundary signals: paragraph styles that mark the END of the cover area
+_POST_COVER_STYLES = {
+    'Heading 1', 'Heading 2', '章标题', '一级条标题',
+    '前言、引言标题', '目录、目次标题',
+    'toc 1', 'toc 2', 'toc 3', 'TOC 1', 'TOC 2', 'TOC 3',
+}
+
+
+def _trim_after_cover(doc):
+    """Remove all body content after the cover area, keeping sectPr intact.
+
+    Walks the docx body in order. Stops at the first paragraph that signals
+    post-cover content:
+    - Paragraph style matching a known TOC/preface/body style
+    - Paragraph text containing '目录' / '目次' / '前言' (whitespace-tolerant)
+    - A TOC field code (instrText with TOC)
+
+    Everything from that point up to (but not including) sectPr is deleted.
+    Covers may include tables and section breaks — we skip past those.
+    """
+    body = doc.element.body
+    children = list(body.iterchildren())
+
+    cover_end_idx = None
+    for i, child in enumerate(children):
+        if i > 60:
+            break
+        tag = child.tag
+
+        # Skip tables — covers often have decorative tables
+        if qn('w:tbl') in tag:
+            continue
+
+        # Skip section breaks — cover may span multiple sections
+        if qn('w:sectPr') in tag:
+            continue
+
+        # Only process paragraphs
+        if qn('w:p') not in tag:
+            continue
+
+        text = ''.join(child.itertext())
+        text_norm = re.sub(r'\s+', '', text)
+
+        pStyle = child.find('.//' + qn('w:pStyle'))
+        style_name = pStyle.get(qn('w:val'), '') if pStyle is not None else ''
+
+        # Check style-based boundary
+        if style_name in _POST_COVER_STYLES:
+            cover_end_idx = i
+            break
+
+        # Check for TOC field code
+        instr = child.find('.//' + qn('w:instrText'))
+        if instr is not None and instr.text and 'TOC' in instr.text:
+            cover_end_idx = i
+            break
+
+        # Check whitespace-normalized keyword matching
+        if text_norm in ('目录', '目次', '前言', '引言'):
+            cover_end_idx = i
+            break
+
+        # Short paragraph with keyword (handles "目    录" style variations)
+        if text_norm and len(text_norm) < 10 and (
+            '目录' in text_norm or '目次' in text_norm or '前言' in text_norm
+        ):
+            cover_end_idx = i
+            break
+
+    if cover_end_idx is None:
+        return  # No boundary detected — leave template body intact
+
+    # Delete from cover_end_idx onwards, except sectPr
+    for child in children[cover_end_idx:]:
+        if child.tag != qn('w:sectPr'):
+            body.remove(child)
+
+
+def _replace_cover_title(doc, new_title):
+    """Replace the cover title text while preserving original run formatting."""
+    if not new_title:
         return
-    for style_name, style_def in skeleton.styles.items():
-        try:
-            if style_name in [s.name for s in doc.styles]:
-                style = doc.styles[style_name]
+    for para in doc.paragraphs:
+        style_name = para.style.name if para.style else ""
+        if style_name == "封面标准名称":
+            if para.runs:
+                first_run = para.runs[0]
+                first_run.text = new_title
+                for run in para.runs[1:]:
+                    run.text = ""
             else:
-                continue
-            font = style.font
-            if style_def.font_name:
-                font.name = style_def.font_name
-            if style_def.font_size_pt:
-                font.size = Pt(style_def.font_size_pt)
-            if style_def.bold:
-                font.bold = True
-            if style_def.color:
-                try:
-                    font.color.rgb = RGBColor.from_string(style_def.color)
-                except Exception:
-                    pass
+                para.add_run(new_title)
+            return
+
+
+_STYLE_FONTS = {
+    'Heading 1': (1, '黑体', 16),
+    'Heading 2': (2, '黑体', 14),
+    'Heading 3': (3, '黑体', 12),
+    'Heading 4': (4, '黑体', 12),
+}
+
+
+def _detach_heading_numbering(doc):
+    """Remove multilevel numbering from all heading styles.
+
+    The template's heading styles (Heading 1/2/3/4) may have w:numPr defined
+    in their style XML, linking them to multilevel list numbering. This causes
+    Word to ADD auto-numbering on top of our text-based numbering, creating
+    the dreaded "双重编号" (e.g. Word shows "1 1.1 岗位与巡检").
+    """
+    from lxml import etree
+    # Remove numPr from ANY style whose name indicates it's a heading/标题
+    # style (matches Heading 1-9, 章标题, 一级条标题, 标题1-4, etc.)
+    # Stops Word from stacking auto-numbering on top of our text numbering.
+    for style in doc.styles:
+        name = style.name or ""
+        has_heading_keyword = (
+            'Heading' in name or 'heading' in name or
+            '标题' in name or '章' in name or
+            '条标题' in name or
+            'toc' in name.lower() or 'TOC' in name
+        )
+        if has_heading_keyword:
+            try:
+                for numpr in style.element.findall('.//' + qn('w:numPr')):
+                    numpr.getparent().remove(numpr)
+            except Exception:
+                pass
+
+
+def _ensure_styles(doc):
+    """Create standard heading styles if the document lacks them.
+
+    Template documents often use numeric or Chinese style IDs ('1', '2', '章标题')
+    rather than the built-in 'Heading 1/2/3/4' names. Since downstream pipeline
+    code (`_h1`, `_h2`, etc.) uses `add_heading(text, level=...)`, we must
+    ensure those style names are available.
+    """
+    from lxml import etree
+    existing_names = {s.name for s in doc.styles}
+
+    for style_name, (lvl, font_name, font_size) in _STYLE_FONTS.items():
+        if style_name in existing_names:
+            continue
+        try:
+            s = doc.styles.add_style(style_name, WD_STYLE_TYPE.PARAGRAPH)
+            s.font.name = font_name
+            s.font.size = Pt(font_size)
+            s.font.bold = True
+            try:
+                s.element.rPr.rFonts.set(qn('w:eastAsia'), font_name)
+            except Exception:
+                pass
+            # Set outlineLvl so Word nav pane / TOC pick it up
+            pPr = s.element.find(qn('w:pPr'))
+            if pPr is None:
+                pPr = etree.SubElement(s.element, qn('w:pPr'))
+            outline = etree.SubElement(pPr, qn('w:outlineLvl'))
+            outline.set(qn('w:val'), str(lvl - 1))
         except Exception:
             pass
 
 
 # ====================================================================
-# Cover
+# Default cover (when no template is available)
 # ====================================================================
-
-def _clone_cover_from_template(doc, template_path, cover_title=""):
-    if not template_path or not os.path.exists(template_path):
-        _create_default_cover(doc, cover_title)
-        return
-
-    src_doc = Document(template_path)
-    cover_paras = []
-    for para in src_doc.paragraphs:
-        text = para.text.strip()
-        style_name = para.style.name if para.style else ""
-        if style_name in ("toc 1", "toc 2", "TOC 1", "TOC 2") or text == "目    录":
-            break
-        if "目录" in text and len(text) < 10:
-            break
-        cover_paras.append(para)
-        if len(cover_paras) >= 20:
-            break
-
-    while len(cover_paras) > 1 and not cover_paras[-1].text.strip():
-        cover_paras.pop()
-
-    title_replaced = False
-    for src_para in cover_paras:
-        text = src_para.text.strip()
-        style_name = src_para.style.name if src_para.style else ""
-        is_title = (style_name == "封面标准名称" or
-                     (("标题" in style_name or "名称" in style_name) and len(text) > 3))
-
-        new_para = doc.add_paragraph()
-        _copy_paragraph_format(src_para, new_para)
-
-        if is_title and cover_title and not title_replaced:
-            new_para.clear()
-            run = new_para.add_run(cover_title)
-            _copy_run_format(src_para.runs[0] if src_para.runs else None, run)
-            title_replaced = True
-        else:
-            for src_run in src_para.runs:
-                new_run = new_para.add_run(src_run.text)
-                _copy_run_format(src_run, new_run)
-
-    doc.add_page_break()
-
-
-def _copy_paragraph_format(src_para, dst_para):
-    dst_para.alignment = src_para.alignment
-    pf = src_para.paragraph_format
-    if pf:
-        if pf.space_before:
-            dst_para.paragraph_format.space_before = pf.space_before
-        if pf.space_after:
-            dst_para.paragraph_format.space_after = pf.space_after
-        if pf.line_spacing:
-            dst_para.paragraph_format.line_spacing = pf.line_spacing
-
-
-def _copy_run_format(src_run, dst_run):
-    if src_run is None:
-        return
-    if src_run.font.name:
-        dst_run.font.name = src_run.font.name
-    if src_run.font.size:
-        dst_run.font.size = src_run.font.size
-    if src_run.bold:
-        dst_run.bold = src_run.bold
-    if src_run.italic:
-        dst_run.italic = src_run.italic
-    if src_run.font.color and src_run.font.color.rgb:
-        dst_run.font.color.rgb = src_run.font.color.rgb
-
 
 def _create_default_cover(doc, cover_title=""):
     for _ in range(6):
@@ -231,60 +322,56 @@ def _create_default_cover(doc, cover_title=""):
 
 
 # ====================================================================
-# TOC
+# TOC — Word TOC field (auto-generates on open)
 # ====================================================================
 
-def _estimate_page_numbers(headings: List[dict],
-                           main_sections: List[dict],
-                           attachments: List[dict]) -> List[int]:
-    pages = []
-    current_page = 3  # cover=1, toc=2
-    pages.append(current_page)
-    current_page += 1  # preface
-    for section in main_sections:
-        pages.append(current_page)
-        para_text = "\n".join(section.get("paragraphs", []))
-        line_count = max(1, para_text.count('\n') + 1)
-        current_page += max(1, (line_count + 4) // LINES_PER_PAGE)
-    for att in attachments:
-        pages.append(current_page)
-        para_text = "\n".join(att.get("paragraphs", []))
-        line_count = max(1, para_text.count('\n') + 1)
-        current_page += max(1, (line_count + 2) // LINES_PER_PAGE)
-    return pages
+def _insert_toc_field(doc):
+    """Insert a Word TOC field code so the table of contents is auto-generated.
 
+    Uses TOC field with the `\n` switch (no hyperlinks) to avoid the
+    "Error! Bookmark not defined" compatibility issue in Word 365+.
+    The TOC refreshes automatically when the user opens the document in Word.
+    """
+    from lxml import etree
+    nsmap = {
+        'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main',
+    }
 
-def _generate_text_toc(doc, headings: List[dict],
-                       main_sections: List[dict],
-                       attachments: List[dict]):
-    page_nums = _estimate_page_numbers(headings, main_sections, attachments)
-    _h1(doc, "目    录")
+    h1_para = doc.add_heading("目    录", level=1)
+    for run in h1_para.runs:
+        run.font.color.rgb = BLACK
+        run.font.name = "黑体"
     doc.add_paragraph()
 
-    for i, item in enumerate(headings):
-        level = item.get("level", 2)
-        text = item.get("text", "")
-        if not text:
-            continue
+    p = doc.add_paragraph()
 
-        para = doc.add_paragraph()
-        indent = max(0, level - 1) * 0.6
-        para.paragraph_format.left_indent = Cm(indent)
+    # w:fldChar = begin
+    begin_run = p.add_run()
+    begin_fld = etree.SubElement(begin_run._element, qn('w:fldChar'))
+    begin_fld.set(qn('w:fldCharType'), 'begin')
 
-        tab_stops = para.paragraph_format.tab_stops
-        tab_stops.add_tab_stop(
-            Cm(14.5), alignment=WD_ALIGN_PARAGRAPH.RIGHT, leader=WD_TAB_LEADER.DOTS
-        )
+    # w:instrText = TOC fields
+    instr_run = p.add_run()
+    instr = etree.SubElement(instr_run._element, qn('w:instrText'))
+    instr.set(qn('xml:space'), 'preserve')
+    instr.text = ' TOC \\o "1-3" \\h \\z \\u \\n '
 
-        run = para.add_run(text)
-        run.font.size = Pt(11) if level <= 2 else Pt(10)
-        run.font.name = "宋体"
-        run.font.color.rgb = BLACK
+    # w:fldChar = separate
+    sep_run = p.add_run()
+    sep_fld = etree.SubElement(sep_run._element, qn('w:fldChar'))
+    sep_fld.set(qn('w:fldCharType'), 'separate')
 
-        run2 = para.add_run("\t")
-        page_str = str(page_nums[i]) if i < len(page_nums) else ""
-        run3 = para.add_run(page_str)
-        run3.font.size = Pt(11) if level <= 2 else Pt(10)
+    # Placeholder text (Word replaces it on field update)
+    placeholder = p.add_run("（请更新域以生成目录 / 右键 → 更新域）")
+    placeholder.font.size = Pt(10)
+    placeholder.font.name = "宋体"
+    placeholder.font.color.rgb = RGBColor(128, 128, 128)
+    placeholder.italic = True
+
+    # w:fldChar = end
+    end_run = p.add_run()
+    end_fld = etree.SubElement(end_run._element, qn('w:fldChar'))
+    end_fld.set(qn('w:fldCharType'), 'end')
 
     doc.add_page_break()
 
@@ -327,92 +414,199 @@ def _generate_preface(doc, template_path=None):
     doc.add_page_break()
 
 
-# ====================================================================
-# TOC heading collector
-# ====================================================================
+_PREFACE_PATTERNS = ('前言', '前　言', '前    言', '引言')
+_TOC_PATTERNS = ('目录', '目次')
+_ws_re = re.compile(r'\s+')
+_FRONT_MATTER_SKIP = {'前言', '目录', '目次', '引言', '前　言'}
+_STRIP_NUM = re.compile(r'^(\d+\.)+\d+\s*').sub  # strip "6.1 "/"1.1综合" → "接收"/"综合数据查询"
 
-def _collect_toc_headings(merge_plan, docs_data) -> List[dict]:
-    headings = [{"level": 1, "text": "前言"}]
-    for i, section in enumerate(merge_plan.main_sections):
-        h = section.get("heading", "")
-        if h and "前言" not in h and "目录" not in h:
-            clean = re.sub(r'^[\d.、\s]+', '', h).strip()
-            headings.append({"level": 1, "text": f"{i + 1} {clean}"})
-    if merge_plan.attachments:
-        for att in merge_plan.attachments:
-            headings.append({"level": 1, "text": att.get("name", "附件")})
-    return headings
+
+def _is_preface_heading(heading: str) -> bool:
+    """Check if a heading is preface — handles whitespace variations."""
+    if not heading:
+        return False
+    norm = _ws_re.sub('', heading)
+    return any(p.replace(' ', '').replace('　', '') in norm for p in _PREFACE_PATTERNS)
+
+
+def _is_toc_heading(heading: str) -> bool:
+    if not heading:
+        return False
+    norm = _ws_re.sub('', heading)
+    return any(p in norm for p in _TOC_PATTERNS)
+
+
+def _is_front_matter_heading(heading: str) -> bool:
+    return _is_preface_heading(heading) or _is_toc_heading(heading)
 
 
 # ====================================================================
 # Appendix content cleaning
 # ====================================================================
 
-_ws_re = re.compile(r'\s+')
-_FRONT_MATTER_SKIP = {'前言', '目录', '目次'}
-
 
 def _norm(s: str) -> str:
-    return _ws_re.sub('', s).strip()
+    """Normalize a heading for comparison: strip whitespace and leading numbering."""
+    s = _ws_re.sub('', s).strip()
+    s = re.sub(r'^[\d\.、]+', '', s).strip()
+    return s
 
 
-def _should_skip_section(heading: str, body_headings: set) -> bool:
-    """Check if a section heading should be skipped in appendix rendering."""
+# Universal boilerplate chapters — filtered from appendices because they
+# duplicate main body content. Operational chapters (作业要求, 应急处置, etc.)
+# are kept so detailed steps survive.
+_UNIVERSAL_BOILERPLATE = {
+    '前言', '目录', '目次', '引言',
+    '范围', '规范性引用文件', '规范性引用文献',
+    '术语和定义', '术语', '定义',
+    '缩略语', '符号和缩略语', '符号',
+}
+
+# Authoring styles that mark front matter in standard docx templates.
+# Any section whose original style name is one of these gets dropped entirely
+# from the appendix, even if its heading text doesn't match a known keyword.
+_FRONT_MATTER_STYLES = {
+    '封面标准名称', '封面标准号', '封面标准号2',
+    '其他标准标志', '其他标准称谓',
+    '其他发布日期', '其他实施日期',
+    '前言、引言标题',
+    '目录、目次标题',
+    'toc 1', 'toc 2', 'toc 3',
+    'TOC 1', 'TOC 2', 'TOC 3',
+}
+
+# Regex matching the first "real content" chapter heading.
+# Examples: "1 范围", "1.范围", "1、范围", "1） 范围", "一 范围", "第一章 ..."
+_NUMBERED_CHAPTER_RE = re.compile(
+    r'^\s*(?:第\s*[一二三四五六七八九十0-9]+\s*(?:章|节|条)|'
+    r'[1-9一二三四五六七八九][\d]*)\s*[\.\、\)\）\s]'
+)
+
+
+def _is_numbered_chapter(heading: str) -> bool:
+    if not heading:
+        return False
+    return bool(_NUMBERED_CHAPTER_RE.match(heading.strip()))
+
+
+def _should_skip_section(heading: str, body_headings: set, style_name: str = "") -> bool:
+    """Check if a section heading should be skipped in appendix rendering.
+
+    Skips: empty/preamble headings, front matter (preface/TOC), universal
+    boilerplate chapters, and any section whose original docx style marks it
+    as cover/preface/TOC content.
+    """
+    if style_name and style_name in _FRONT_MATTER_STYLES:
+        return True
     h_norm = _norm(heading)
     if not h_norm or h_norm == '_preamble':
         return True
     if h_norm in _FRONT_MATTER_SKIP:
         return True
-    for bh in body_headings:
-        bh_norm = _norm(bh)
-        if not bh_norm:
-            continue
-        if h_norm == bh_norm or h_norm.startswith(bh_norm) or bh_norm.startswith(h_norm):
-            return True
+    if _is_front_matter_heading(heading):
+        return True
+    if h_norm in _UNIVERSAL_BOILERPLATE:
+        return True
     return False
 
 
+def _find_content_start_index(sections: List[dict]) -> int:
+    """Find the index of the first 'real content' section.
+
+    Scans top-level sections for the first one whose heading starts with a
+    chapter number (1 / 一 / 第一章 / etc). Everything before that is treated
+    as front matter (cover + preface + TOC + bookkeeping) and dropped.
+
+    Returns 0 if no numbered chapter is found — caller falls back to per-section
+    filtering only.
+    """
+    for i, sec in enumerate(sections):
+        heading = (sec.get("heading", "") or "").strip()
+        if _is_numbered_chapter(heading):
+            return i
+    return 0
+
+
 def _render_appendix_sections(doc, sections: List[dict], body_headings: set,
-                               image_map: dict, level_prefix=None):
-    """Recursively render source doc sections as appendix content."""
+                               image_map: dict, level_prefix=None,
+                               apply_content_boundary: bool = True):
+    """Recursively render source doc sections as appendix content.
+
+    Renders body items (paragraphs + images) in their original source order
+    using the `body` field when present, falling back to paragraphs + images.
+
+    apply_content_boundary: when True (top-level call), skip all sections
+    before the first numbered chapter to drop cover/preface/TOC entirely.
+    """
     if level_prefix is None:
         level_prefix = [1]
 
+    # Top-level boundary: drop everything before the first "1 xxx" / "一 xxx"
+    if apply_content_boundary:
+        start = _find_content_start_index(sections)
+        if start > 0:
+            sections = sections[start:]
+
     for sec in sections:
         sec_heading = sec.get("heading", "").strip()
+        sec_style = sec.get("style_name", "") or ""
 
-        if _should_skip_section(sec_heading, body_headings):
+        if _should_skip_section(sec_heading, body_headings, sec_style):
             continue
 
         has_heading = bool(sec_heading)
         if has_heading:
             level = len(level_prefix)
             num_str = ".".join(str(x) for x in level_prefix)
+            # Depth-mapped heading: depth 1 → H2, depth 2 → H3, depth 3+ → H4
+            # so multi-level structure shows up correctly in Word's nav pane
             if level >= 3:
+                _h4(doc, f"{num_str} {sec_heading}")
+            elif level == 2:
                 _h3(doc, f"{num_str} {sec_heading}")
-            elif level >= 2:
-                _h2(doc, f"{num_str} {sec_heading}")
             else:
                 _h2(doc, f"{num_str} {sec_heading}")
 
-        for p_text in sec.get("paragraphs", []):
-            if p_text.strip():
-                _body(doc, p_text.strip())
-
-        section_tables = sec.get("tables", [])
-        for tbl_data in section_tables:
-            if isinstance(tbl_data, list) and tbl_data:
-                _table(doc, tbl_data)
-
-        matched_images = image_map.get(sec_heading, [])
-        for img in matched_images:
-            _add_image_to_doc(doc, img.blob, img.content_type,
-                              caption=img.filename)
+        # Prefer ordered body (interleaved text/image/table), fall back to legacy fields
+        body_items = sec.get("body", [])
+        if body_items:
+            for item in body_items:
+                kind = item.get("type")
+                value = item.get("value")
+                if kind == "text" and value and str(value).strip():
+                    _body(doc, str(value).strip())
+                elif kind == "image" and value is not None:
+                    # value is the original Image dataclass instance
+                    blob = getattr(value, "blob", None)
+                    if blob:
+                        caption = getattr(value, "caption", "") or ""
+                        _add_image_to_doc(doc, blob, getattr(value, "content_type", ""),
+                                          caption=caption)
+                elif kind == "table" and value is not None:
+                    # value is a Table dataclass with .rows attribute
+                    rows = getattr(value, "rows", None) or []
+                    if rows:
+                        _table(doc, rows)
+        else:
+            # Legacy fallback (body field wasn't populated): render fields separately
+            for p_text in sec.get("paragraphs", []):
+                if p_text.strip():
+                    _body(doc, p_text.strip())
+            for tbl_data in sec.get("tables", []):
+                if isinstance(tbl_data, list) and tbl_data:
+                    _table(doc, tbl_data)
+            matched_images = image_map.get(sec_heading, [])
+            for img in matched_images:
+                _add_image_to_doc(doc, img.blob, img.content_type,
+                                  caption=getattr(img, "caption", "") or "")
 
         children = sec.get("children", [])
         if children:
             child_prefix = level_prefix + [1]
-            _render_appendix_sections(doc, children, body_headings, image_map, child_prefix)
+            _render_appendix_sections(
+                doc, children, body_headings, image_map, child_prefix,
+                apply_content_boundary=False,
+            )
 
         if has_heading:
             level_prefix[-1] += 1
@@ -427,16 +621,38 @@ def _is_table_row(line: str) -> bool:
     return '|' in line and line.count('|') >= 2
 
 
+_SEPARATOR_CELL_RE = re.compile(r'^[\s\-:]+$')
+
+
+def _is_separator_row(cells: List[str]) -> bool:
+    """Detect markdown table separator rows like |---|---|, |:--|--:|."""
+    if not cells:
+        return False
+    return all(_SEPARATOR_CELL_RE.match(c or "") for c in cells)
+
+
 def _parse_table_lines(lines: List[str]) -> Optional[List[List[str]]]:
-    """Parse pipe-separated or tab-separated lines into a table."""
+    """Parse pipe-separated or tab-separated lines into a table.
+
+    Skips markdown separator rows (|---|---|) so they don't appear as data
+    rows in the rendered Word table.
+    """
     if not lines or not _is_table_row(lines[0]):
         return None
     rows = []
     for line in lines:
         if _is_table_row(line):
-            cells = [c.strip() for c in line.split('|') if c.strip()]
-            if cells:
-                rows.append(cells)
+            cells = [c.strip() for c in line.split('|') if c.strip() or True]
+            # Strip the leading/trailing empty cells introduced by | at row edges
+            if cells and cells[0] == "":
+                cells = cells[1:]
+            if cells and cells[-1] == "":
+                cells = cells[:-1]
+            if not cells:
+                continue
+            if _is_separator_row(cells):
+                continue
+            rows.append(cells)
         elif not line.strip():
             break
         else:
@@ -487,34 +703,43 @@ def generate_merged_docx(merge_plan, docs_data,
                          cover_title="",
                          skeleton=None,
                          template_path=None) -> str:
-    doc = Document()
 
-    if skeleton:
-        _apply_template_styles(doc, skeleton)
-
-    # Default font
-    style = doc.styles['Normal']
-    font = style.font
-    font.name = '宋体'
-    font.size = Pt(10.5)
-    try:
-        style.element.rPr.rFonts.set(qn('w:eastAsia'), '宋体')
-    except Exception:
-        pass
-
-    # Page margins
-    if skeleton and skeleton.page_layout and skeleton.page_layout.margin_top:
-        for s in doc.sections:
-            s.top_margin = skeleton.page_layout.margin_top
-            s.bottom_margin = skeleton.page_layout.margin_bottom
-            s.left_margin = skeleton.page_layout.margin_left
-            s.right_margin = skeleton.page_layout.margin_right
+    # ================================================================
+    # 0. START WITH TEMPLATE (if available) — preserves cover 100%
+    # ================================================================
+    if template_path and os.path.exists(template_path):
+        shutil.copy(template_path, output_path)
+        doc = Document(output_path)
+        _ensure_styles(doc)
+        _detach_heading_numbering(doc)
+        _trim_after_cover(doc)
+        final_title = merge_plan.cover_title or cover_title or "操作规程"
+        _replace_cover_title(doc, final_title)
     else:
-        for s in doc.sections:
-            s.top_margin = Cm(2.5)
-            s.bottom_margin = Cm(2.5)
-            s.left_margin = Cm(2.8)
-            s.right_margin = Cm(2.0)
+        doc = Document()
+        # Default font
+        style = doc.styles['Normal']
+        font = style.font
+        font.name = '宋体'
+        font.size = Pt(10.5)
+        try:
+            style.element.rPr.rFonts.set(qn('w:eastAsia'), '宋体')
+        except Exception:
+            pass
+        if skeleton and skeleton.page_layout and skeleton.page_layout.margin_top:
+            for s in doc.sections:
+                s.top_margin = skeleton.page_layout.margin_top
+                s.bottom_margin = skeleton.page_layout.margin_bottom
+                s.left_margin = skeleton.page_layout.margin_left
+                s.right_margin = skeleton.page_layout.margin_right
+        else:
+            for s in doc.sections:
+                s.top_margin = Cm(2.5)
+                s.bottom_margin = Cm(2.5)
+                s.left_margin = Cm(2.8)
+                s.right_margin = Cm(2.0)
+        final_title = merge_plan.cover_title or cover_title or "操作规程"
+        _create_default_cover(doc, final_title)
 
     # Build body_headings set for appendix filtering
     body_headings = set()
@@ -525,16 +750,14 @@ def generate_merged_docx(merge_plan, docs_data,
             body_headings.add(h_clean)
 
     # ================================================================
-    # 1. COVER
+    # 1. COVER (template path handled above)
     # ================================================================
-    final_title = merge_plan.cover_title or cover_title or "操作规程"
-    _clone_cover_from_template(doc, template_path, final_title)
+    # (cover section already placed above via template copy or default cover)
 
     # ================================================================
-    # 2. TOC
+    # 2. TOC — Word field code, auto-updates on open
     # ================================================================
-    toc_headings = _collect_toc_headings(merge_plan, docs_data)
-    _generate_text_toc(doc, toc_headings, merge_plan.main_sections, merge_plan.attachments)
+    _insert_toc_field(doc)
 
     # ================================================================
     # 3. PREFACE — Heading 1, same level as body chapters
@@ -551,7 +774,7 @@ def generate_merged_docx(merge_plan, docs_data,
             paragraphs = section.get("paragraphs", [])
             tables = section.get("tables", [])
 
-            if not heading or "前言" in heading or "目录" in heading:
+            if not heading or _is_front_matter_heading(heading):
                 continue
 
             clean_heading = re.sub(r'^[\d.、\s]+', '', heading).strip()
@@ -561,7 +784,7 @@ def generate_merged_docx(merge_plan, docs_data,
             _h1(doc, numbered)
 
             # Per-chapter sub-section counters
-            inner_counter = {"sub2": 0, "sub3": 0}
+            inner_counter = {"sub2": 0, "sub3": 0, "sub4": 0}
 
             # Write content with sub-section detection
             for p_text in paragraphs:
@@ -579,25 +802,55 @@ def generate_merged_docx(merge_plan, docs_data,
                     if not line:
                         continue
 
-                    # Detect ## / ### markers for sub-sections
-                    h2_marker = re.match(r'^##\s+(.+)', line)
+                    # Detect #### / ### / ## markers for sub-sections
+                    h4_marker = re.match(r'^####\s+(.+)', line)
                     h3_marker = re.match(r'^###\s+(.+)', line)
+                    h2_marker = re.match(r'^##\s+(.+)', line)
 
                     # Detect numbered heading patterns (fallback)
                     sub2_match = re.match(r'^(\d+)\.(\d+)\s+(.+)', line)
                     sub3_match = re.match(r'^(\d+)\.(\d+)\.(\d+)\s+(.+)', line)
 
-                    if h3_marker:
-                        inner_counter["sub3"] += 1
-                        title = h3_marker.group(1).strip()
-                        new_line = f"{chapter_idx + 1}.{inner_counter['sub2']}.{inner_counter['sub3']} {title}"
-                        _h3(doc, new_line)
+                    if h4_marker:
+                        # If no H2/H3 exists yet, downshift to the correct level
+                        if inner_counter["sub2"] == 0: inner_counter["sub2"] = 1
+                        if inner_counter["sub3"] == 0: inner_counter["sub3"] = 1
+                        inner_counter["sub4"] += 1
+                        title = _STRIP_NUM('', h4_marker.group(1)).strip()
+                        if title == clean_heading:
+                            inner_counter["sub4"] -= 1
+                        else:
+                            new_line = f"{chapter_idx + 1}.{inner_counter['sub2']}.{inner_counter['sub3']}.{inner_counter['sub4']} {title}"
+                            _h4(doc, new_line)
+                    elif h3_marker:
+                        # No prior H2? Treat as H2 level, not H3 (prevents "4.0.1")
+                        if inner_counter["sub2"] == 0:
+                            inner_counter["sub2"] += 1
+                            title = _STRIP_NUM('', h3_marker.group(1)).strip()
+                            if title == clean_heading:
+                                inner_counter["sub2"] -= 1
+                            else:
+                                new_line = f"{chapter_idx + 1}.{inner_counter['sub2']} {title}"
+                                _h2(doc, new_line)
+                        else:
+                            inner_counter["sub3"] += 1
+                            inner_counter["sub4"] = 0
+                            title = _STRIP_NUM('', h3_marker.group(1)).strip()
+                            if title == clean_heading:
+                                inner_counter["sub3"] -= 1
+                            else:
+                                new_line = f"{chapter_idx + 1}.{inner_counter['sub2']}.{inner_counter['sub3']} {title}"
+                                _h3(doc, new_line)
                     elif h2_marker:
                         inner_counter["sub2"] += 1
                         inner_counter["sub3"] = 0
-                        title = h2_marker.group(1).strip()
-                        new_line = f"{chapter_idx + 1}.{inner_counter['sub2']} {title}"
-                        _h2(doc, new_line)
+                        inner_counter["sub4"] = 0
+                        title = _STRIP_NUM('', h2_marker.group(1)).strip()
+                        if title == clean_heading:
+                            inner_counter["sub2"] -= 1
+                        else:
+                            new_line = f"{chapter_idx + 1}.{inner_counter['sub2']} {title}"
+                            _h2(doc, new_line)
                     elif sub3_match:
                         c, s, ss, title = sub3_match.groups()
                         inner_counter["sub2"] = int(s)
@@ -623,7 +876,7 @@ def generate_merged_docx(merge_plan, docs_data,
             body_images = _match_body_images(all_images_by_doc, clean_heading)
             for img in body_images:
                 _add_image_to_doc(doc, img.blob, img.content_type,
-                                  caption=img.filename)
+                                  caption=getattr(img, "caption", "") or "")
 
             doc.add_paragraph()
             chapter_idx += 1

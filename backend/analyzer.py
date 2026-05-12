@@ -109,38 +109,95 @@ def _dedup_images_by_hash(images: List[dict], threshold: int = 5) -> List[dict]:
 # Phase 1: Structure Planning
 # ---------------------------------------------------------------------------
 
+def _extract_template_body_chapters(template_sections: List[SectionNode]) -> List[dict]:
+    """Extract body chapters from the correctly-structured template tree.
+
+    The tree (built via outlineLvl) has L2 items as chapters and L3+ items
+    as sub-sections. We flatten this into main_sections for the merger.
+    章标题-styled nodes are filtered out (they are appendix content).
+    """
+    chapters: List[dict] = []
+
+    def _walk(nodes: List[SectionNode], parent_is_chapter: bool = False):
+        for node in nodes:
+            heading = node.heading.strip()
+            style = node.style_name or ""
+            if not heading:
+                continue
+            if node.style_name in ("封面标准名称", "封面标准号2", "其他标准标志",
+                                    "其他标准称谓", "其他发布日期", "其他实施日期"):
+                continue
+            if heading.startswith("附件") or heading.startswith("附录"):
+                continue
+            if any(k in heading for k in ("目录", "目次")):
+                continue
+
+            # 前言-level → recurse into children (they ARE the chapters)
+            if style in ("前言、引言标题", "前言、引言标题") or heading in ("前言",):
+                _walk(node.children)
+                continue
+
+            # 章标题 → skip entirely (appendix content)
+            if style == "章标题":
+                continue
+
+            # L2 node → chapter; deeper nodes → sub-sections
+            if node.level == 2:
+                sub_headings = []
+                for child in node.children:
+                    if child.level >= 3:
+                        # Convert template's absolute level to relative prompt
+                        # level: chapter=L2 → L2 child=L3 → prompt level=2 (##)
+                        # deep child=L4 → prompt level=3 (###)
+                        prompt_level = max(2, child.level - 1)
+                        sub_headings.append({
+                            "text": child.heading.strip(),
+                            "level": prompt_level,
+                        })
+                chapters.append({
+                    "heading": heading,
+                    "level": 1,
+                    "style_name": "Heading 2",
+                    "subheadings": sub_headings,
+                })
+            elif node.level >= 3 and parent_is_chapter:
+                # Deep node under a chapter → still need to handle
+                # (This catches edge cases like 章标题 with children)
+                pass
+
+    _walk(template_sections)
+    return chapters
+
+
 def _build_structure_plan_prompt(template_sections: List[SectionNode],
                                   doc_summaries: List[dict],
                                   has_template: bool) -> str:
     """Build prompt for AI to plan the output document structure."""
 
     if has_template:
-        # Filter to only body chapters (exclude cover, TOC, appendix headings)
-        body_sections = []
-        for s in template_sections:
-            heading = s.heading.strip()
-            if heading.startswith("附件") or heading.startswith("附录"):
-                continue
-            if "目录" in heading or "目次" in heading:
-                continue
-            if s.style_name in ("封面标准名称", "封面标准号2", "其他标准标志",
-                                 "其他标准称谓", "其他发布日期", "其他实施日期"):
-                continue
-            body_sections.append(s)
+        # Render full template tree as AI reference (auto-numbering heads)
+        def _render_tree(nodes, depth=0):
+            lines = []
+            for s in nodes:
+                heading = s.heading.strip()
+                if not heading: continue
+                if heading.startswith("附件") or heading.startswith("附录"): continue
+                if "目录" in heading or "目次" in heading: continue
+                if s.style_name in ("封面标准名称", "封面标准号2", "其他标准标志",
+                                     "其他标准称谓", "其他发布日期", "其他实施日期"): continue
+                if s.style_name in ("章标题",): continue  # appendix content, not body
+                lines.append("  " * depth + f"[H{s.level}] {heading}")
+                lines += _render_tree(s.children, depth + 1)
+            return lines
 
-        chapter_desc = []
-        for s in body_sections:
-            indent = "  " * s.level
-            chapter_desc.append(f"{indent}[H{s.level}] {s.heading}")
-        chapter_text = "\n".join(chapter_desc) if chapter_desc else "（模板无明确正文标题，请根据源文件内容自行确定）"
+        tree_lines = _render_tree(template_sections)
+        tree_text = "\n".join(tree_lines) if tree_lines else "（模板无明确正文标题，请根据源文件内容自行确定）"
 
-        template_instruction = f"""## 模板章节结构（严格遵循，不得增减）
+        template_instruction = f"""## 参考模板结构
 
-以下是模板的正文标题。main_sections 必须恰好是以下 {len(body_sections)} 个标题，不得增加、减少或改变顺序：
+以下是上传的模板文档的章节树结构（含层级）。请**参考**这个结构来规划合并文档的章节，但最终的章节标题和数量需要根据源文件实际内容来合理确定，不要生搬硬套模板：
 
-{chapter_text}
-
-重要：不要额外添加如"车间化验""上位机操作""机泵操作""加药系统操作""深度处理系统运行""污泥处理系统运行"等章节。这些内容应作为"作业要求"章节下的子节处理。"""
+{tree_text}"""
     else:
         template_instruction = """## 无模板
 
@@ -256,7 +313,8 @@ def plan_structure(template_sections: List[SectionNode],
 # ---------------------------------------------------------------------------
 
 def _build_section_synthesis_prompt(heading: str, all_source_texts: List[dict],
-                                     attachment_names: List[str]) -> str:
+                                     attachment_names: List[str],
+                                     subheadings: Optional[List] = None) -> str:
     """Build prompt for synthesizing one body chapter from all source docs."""
     sources_text = []
     for s in all_source_texts:
@@ -268,10 +326,33 @@ def _build_section_synthesis_prompt(heading: str, all_source_texts: List[dict],
 
     att_refs = "\n".join(f"- 《{a}》" for a in attachment_names) if attachment_names else "（无）"
 
+    if subheadings:
+        outline_lines = []
+        for sh in subheadings:
+            text = sh.get("text", "") if isinstance(sh, dict) else str(sh)
+            lvl = max(2, int(sh.get("level", 2))) if isinstance(sh, dict) else 2
+            if not text:
+                continue
+            marker = "#" * lvl
+            indent = "  " * (lvl - 2)
+            outline_lines.append(f"{indent}{marker} {text}")
+        outline_block = "\n".join(outline_lines)
+        structure_constraint = f"""
+
+## 强制子标题结构
+本章节必须按以下多级层次组织内容。**每条都不可省略、不可调顺序、不可改文字、不可增加未列出的新标题**（模板固定结构）：
+```
+{outline_block}
+```
+格式约定：## 为二级 (N.1)、### 为三级 (N.1.1)、#### 为四级。不要在标题里写数字。"""
+    else:
+        structure_constraint = ""
+
     return f"""你是一个专业的企业文档编辑。请为统一操作规程撰写「{heading}」章节的内容。
 
 ## 任务
 综合以下 {len(all_source_texts)} 个源文件的内容，撰写一个统一的「{heading}」章节。
+{structure_constraint}
 
 撰写要求：
 - 提取所有源文件中与「{heading}」相关的内容，融合为通顺、精炼的表述
@@ -279,7 +360,7 @@ def _build_section_synthesis_prompt(heading: str, all_source_texts: List[dict],
 - 如果某操作有详细步骤在附件中，引用附件：如"具体操作参照《附件A：XXX》"
 - **子标题标记**：如果该章节下有多个子主题，二级标题以"## "开头（如"## 岗位与巡检"），三级标题以"### "开头（如"### 操作前准备"）。不要自行添加任何数字编号，编号由系统自动生成
 - **内容用列表组织**：子标题下的内容尽量用"a) xxx\nb) xxx\nc) xxx"或"1. xxx\n2. xxx"的编号列表形式逐条列出，清晰易读
-- **适合表格的内容用表格**：如果内容是规格参数、对比信息、清单类数据，用"| 列1 | 列2 |"的markdown表格格式输出
+- **表格必须内联完整输出**：如果需要表格，**必须**用 markdown 格式 `| 列1 | 列2 |\\n|---|---|\\n| 值1 | 值2 |` 完整输出。严禁"见表1"等只有引用没有表格的写法
 - **不要给章节标题本身加编号**（标题编号由系统自动添加），直接写正文内容
 - **不要使用markdown格式**：不要使用**加粗**、*斜体*等markdown标记，直接输出纯文本内容
 - 保持企业标准文档的专业、简洁风格
@@ -298,12 +379,14 @@ def _build_section_synthesis_prompt(heading: str, all_source_texts: List[dict],
 
 def _synthesize_section(heading: str, all_source_texts: List[dict],
                          attachment_names: List[str],
-                         progress_callback=None) -> dict:
+                         progress_callback=None,
+                         subheadings: Optional[List] = None) -> dict:
     """Phase 2: AI synthesizes one body chapter from all source docs."""
     import anthropic
     import httpx
 
-    prompt = _build_section_synthesis_prompt(heading, all_source_texts, attachment_names)
+    prompt = _build_section_synthesis_prompt(heading, all_source_texts, attachment_names,
+                                             subheadings=subheadings)
 
     http_client = httpx.Client(verify=HTTP_VERIFY_SSL, trust_env=HTTP_TRUST_ENV)
     client = anthropic.Anthropic(
@@ -456,16 +539,45 @@ def analyze_documents(docs_data: List[dict],
     doc_summaries = _build_doc_summaries(docs_data)
 
     # Phase 1: Plan structure
-    if ANTHROPIC_API_KEY:
-        try:
-            structure_plan = plan_structure(
-                template_sections or [], doc_summaries, has_template, progress_callback,
-            )
-        except Exception as e:
-            logger.error("Structure planning failed: %s, using fallback", e)
-            structure_plan = _fallback_plan(doc_summaries)
+    # With template: directly extract chapters from the template tree
+    # (outlineLvl-based parsing gives correct hierarchy).
+    # Without template: AI plans from scratch.
+    if has_template:
+        template_chapters = _extract_template_body_chapters(template_sections)
+        if template_chapters:
+            structure_plan = None
+            if ANTHROPIC_API_KEY:
+                try:
+                    structure_plan = plan_structure(
+                        template_sections, doc_summaries, has_template, progress_callback,
+                    )
+                except Exception:
+                    pass
+            if not structure_plan:
+                structure_plan = _fallback_plan(doc_summaries)
+            structure_plan["main_sections"] = template_chapters
+        else:
+            if ANTHROPIC_API_KEY:
+                try:
+                    structure_plan = plan_structure(
+                        template_sections or [], doc_summaries, has_template, progress_callback,
+                    )
+                except Exception as e:
+                    logger.error("Structure planning failed: %s, using fallback", e)
+                    structure_plan = _fallback_plan(doc_summaries)
+            else:
+                structure_plan = _fallback_plan(doc_summaries)
     else:
-        structure_plan = _fallback_plan(doc_summaries)
+        if ANTHROPIC_API_KEY:
+            try:
+                structure_plan = plan_structure(
+                    template_sections or [], doc_summaries, has_template, progress_callback,
+                )
+            except Exception as e:
+                logger.error("Structure planning failed: %s, using fallback", e)
+                structure_plan = _fallback_plan(doc_summaries)
+        else:
+            structure_plan = _fallback_plan(doc_summaries)
 
     # Build full text dicts for Phase 2
     doc_texts = []
@@ -508,6 +620,7 @@ def analyze_documents(docs_data: List[dict],
                 doc_texts,
                 attachment_names,
                 progress_callback,
+                subheadings=sec_info.get("subheadings") or None,
             )
 
         results_by_heading = {}

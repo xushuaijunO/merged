@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional
 from docx import Document as DocxDocument
+from docx.oxml.ns import qn
 
 
 @dataclass
@@ -75,6 +76,8 @@ STYLE_LEVEL_MAP = {
     "Heading 1": 1, "Heading 2": 2, "Heading 3": 3,
     "Heading 4": 4, "Heading 5": 5, "Heading 6": 6,
     "章标题": 1, "一级条标题": 2, "二级条标题": 3, "三级条标题": 4,
+    "标题 1": 1, "标题 2": 2, "标题 3": 3, "标题 4": 4,
+    "标题1": 1,  "标题2": 2,  "标题3": 3,  "标题4": 4,
     "前言、引言标题": 1, "封面标准名称": 1,
 }
 
@@ -141,7 +144,24 @@ def parse_template(filepath: str) -> TemplateSkeleton:
         if not text:
             continue
         style_name = p.style.name if p.style else ""
-        level = _get_level(style_name)
+
+        # Prefer Word style's outlineLvl over the static STYLE_LEVEL_MAP.
+        # The outlineLvl is the canonical hierarchy level (0 = Heading 1)
+        # and correctly captures templates where Chinese-named styles like
+        # 一级条标题 have outlineLvl=2 (same as Heading 3).
+        style_level = _get_level(style_name)
+        if style_level > 0:
+            try:
+                outline = p.style.element.find('.//' + qn('w:outlineLvl'))
+                if outline is not None:
+                    level = int(outline.get(qn('w:val'))) + 1
+                else:
+                    level = style_level
+            except Exception:
+                level = style_level
+        else:
+            level = 0
+
         if level > 0:
             node = SectionNode(heading=text, level=level, style_name=style_name)
             while section_stack and section_stack[-1].level >= level:
