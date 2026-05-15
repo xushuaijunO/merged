@@ -410,7 +410,22 @@ def parse_document(filepath: str, filename: str) -> ParsedDocument:
         style_name = pdata["style_name"]
         has_image = pdata["has_image"]
         img_rid = pdata["img_rid"]
-        level = get_heading_level(style_name)
+        # Use outlineLvl from style definition (same as template_parser)
+        # to correctly distinguish "8.1" (olvl=1→H2), "8.1.1" (olvl=2→H3),
+        # "8.1.1.1" (olvl=3→H4) even when all use the same style name.
+        style_level = get_heading_level(style_name)
+        if style_level > 0:
+            try:
+                s = doc.styles[style_name]
+                outline = s.element.find('.//' + qn('w:outlineLvl'))
+                if outline is not None:
+                    level = int(outline.get(qn('w:val'))) + 1
+                else:
+                    level = style_level
+            except Exception:
+                level = style_level
+        else:
+            level = 0
 
         # --- Get context: text of surrounding paragraphs ---
         context_before = ""

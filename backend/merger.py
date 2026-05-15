@@ -419,6 +419,8 @@ _TOC_PATTERNS = ('目录', '目次')
 _ws_re = re.compile(r'\s+')
 _FRONT_MATTER_SKIP = {'前言', '目录', '目次', '引言', '前　言'}
 _STRIP_NUM = re.compile(r'^(\d+\.)+\d+\s*').sub  # strip "6.1 "/"1.1综合" → "接收"/"综合数据查询"
+_STRIP_CN_NUM = re.compile(r'^[一二三四五六七八九十]+[、．.\s]+').sub  # strip "一、概述" → "概述"
+_STRIP_SIMPLE_NUM = re.compile(r'^\d+[、．.)、]\s*').sub  # strip "1、进入" → "进入"
 
 
 def _is_preface_heading(heading: str) -> bool:
@@ -552,20 +554,34 @@ def _render_appendix_sections(doc, sections: List[dict], body_headings: set,
         sec_style = sec.get("style_name", "") or ""
 
         if _should_skip_section(sec_heading, body_headings, sec_style):
+            children = sec.get("children", [])
+            if children:
+                _render_appendix_sections(
+                    doc, children, body_headings, image_map, level_prefix,
+                    apply_content_boundary=False,
+                )
             continue
 
         has_heading = bool(sec_heading)
         if has_heading:
             level = len(level_prefix)
             num_str = ".".join(str(x) for x in level_prefix)
+            # Strip source-document numbering from heading text:
+            #   "一、概述" → "概述",  "1、进入" → "进入",  "11.1 测定" → "测定"
+            clean_sec_title = _STRIP_NUM('', sec_heading)
+            clean_sec_title = _STRIP_CN_NUM('', clean_sec_title)
+            clean_sec_title = _STRIP_SIMPLE_NUM('', clean_sec_title)
+            clean_sec_title = clean_sec_title.strip()
+            if not clean_sec_title:
+                clean_sec_title = sec_heading.strip()
             # Depth-mapped heading: depth 1 → H2, depth 2 → H3, depth 3+ → H4
             # so multi-level structure shows up correctly in Word's nav pane
             if level >= 3:
-                _h4(doc, f"{num_str} {sec_heading}")
+                _h4(doc, f"{num_str} {clean_sec_title}")
             elif level == 2:
-                _h3(doc, f"{num_str} {sec_heading}")
+                _h3(doc, f"{num_str} {clean_sec_title}")
             else:
-                _h2(doc, f"{num_str} {sec_heading}")
+                _h2(doc, f"{num_str} {clean_sec_title}")
 
         # Prefer ordered body (interleaved text/image/table), fall back to legacy fields
         body_items = sec.get("body", [])
