@@ -220,6 +220,13 @@ def get_heading_level(style_name: str) -> int:
             return int(style_name.split()[-1])
         except (ValueError, IndexError):
             pass
+    if "表标题" in style_name:
+        return 0
+    # Derive level from "X级" pattern: "二级无"→3, "三级条标题"→4, etc.
+    cn_num = {'一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6}
+    m = re.match(r'([一二三四五六])级', style_name)
+    if m:
+        return cn_num.get(m.group(1), 2) + 2
     if "标题" in style_name or "Heading" in style_name:
         return 2
     return 0

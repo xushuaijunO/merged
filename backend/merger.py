@@ -75,17 +75,22 @@ def _body(doc, text):
     """Normal body paragraph (宋体 10.5pt).
 
     Automatically strips leading heading-numbering patterns (e.g. "1.1 内容")
-    from body paragraphs — these are often source-doc numbering that slipped
-    into the AI-generated text.
+    from body paragraphs. Preserves **bold** markers as actual bold runs.
     """
-    cleaned = _strip_markdown(text)
     # Strip "N.M content" / "N.M.K content" etc. from the start of body text
-    cleaned = re.sub(r'^\d+(?:\.\d+)+\s+', '', cleaned).strip()
+    cleaned = re.sub(r'^\d+(?:\.\d+)+\s+', '', text).strip()
     p = doc.add_paragraph()
-    run = p.add_run(cleaned)
-    run.font.size = Pt(10.5)
-    run.font.name = "宋体"
-    run.font.color.rgb = BLACK
+    # Split on **bold** markers — odd-indexed parts are bold
+    parts = re.split(r'\*\*(.+?)\*\*', cleaned)
+    for i, part in enumerate(parts):
+        if not part:
+            continue
+        run = p.add_run(part)
+        run.font.size = Pt(10.5)
+        run.font.name = "宋体"
+        run.font.color.rgb = BLACK
+        if i % 2 == 1:
+            run.bold = True
     return p
 
 
@@ -103,6 +108,7 @@ def _table(doc, rows: List[List[str]]):
                 cell.text = str(cell_text)
                 if ri == 0:
                     for p in cell.paragraphs:
+                        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
                         for run in p.runs:
                             run.bold = True
                             run.font.size = Pt(9)
@@ -509,6 +515,14 @@ def _should_skip_section(heading: str, body_headings: set, style_name: str = "")
         return True
     if h_norm in _UNIVERSAL_BOILERPLATE:
         return True
+    if '见表' in h_norm:
+        return True
+    if re.match(r'^表\s*\d+', h_norm):
+        return True
+    if h_norm.startswith('本文件规定') or h_norm.startswith('下列文件'):
+        return True
+    if re.match(r'^[A-Z]+-[A-Z]-[A-Z]?\d+', h_norm):
+        return True
     return False
 
 
@@ -530,18 +544,23 @@ def _find_content_start_index(sections: List[dict]) -> int:
 
 
 def _render_appendix_sections(doc, sections: List[dict], body_headings: set,
-                               image_map: dict, level_prefix=None,
+                               image_map: dict, counters=None,
                                apply_content_boundary: bool = True):
     """Recursively render source doc sections as appendix content.
 
-    Renders body items (paragraphs + images) in their original source order
-    using the `body` field when present, falling back to paragraphs + images.
+    Uses section-level-based counting: each section's heading depth is
+    determined by its own ``level`` from parsing, not by tree position.
+    This ensures consistent numbering regardless of which parent sections
+    were skipped as front matter or boilerplate.
 
-    apply_content_boundary: when True (top-level call), skip all sections
-    before the first numbered chapter to drop cover/preface/TOC entirely.
+    Counter mapping (base level = 2):
+      level 2 → counter[0] → H2 "N"
+      level 3 → counter[1] → H3 "N.M"
+      level 4 → counter[2] → H4 "N.M.K"
+      level 5+ → bold body text (no heading number)
     """
-    if level_prefix is None:
-        level_prefix = [1]
+    if counters is None:
+        counters = [0]
 
     # Top-level boundary: drop everything before the first "1 xxx" / "一 xxx"
     if apply_content_boundary:
@@ -552,36 +571,88 @@ def _render_appendix_sections(doc, sections: List[dict], body_headings: set,
     for sec in sections:
         sec_heading = sec.get("heading", "").strip()
         sec_style = sec.get("style_name", "") or ""
+        section_level = sec.get("level", 0)
 
         if _should_skip_section(sec_heading, body_headings, sec_style):
+            # Section heading is skipped. For table-related skips, preserve
+            # body content (tables, text) and consume a counter so children
+            # maintain correct numbering. For universal boilerplate (范围,
+            # 规范性引用文件, etc.), skip entirely — no counter, no body.
+            h_norm = _norm(sec_heading)
+            is_boilerplate = (h_norm in _UNIVERSAL_BOILERPLATE or
+                             _is_front_matter_heading(sec_heading) or
+                             h_norm == '_preamble' or
+                             sec_style in _FRONT_MATTER_STYLES or
+                             h_norm.startswith('本文件规定') or
+                             h_norm.startswith('下列文件') or
+                             bool(re.match(r'^[A-Z]+-[A-Z]-[A-Z]?\d+', h_norm)))
+            body_items = sec.get("body", [])
             children = sec.get("children", [])
+            if body_items and not is_boilerplate:
+                for item in body_items:
+                    kind = item.get("type")
+                    value = item.get("value")
+                    if kind == "text" and value and str(value).strip():
+                        _body(doc, str(value).strip())
+                    elif kind == "image" and value is not None:
+                        blob = getattr(value, "blob", None)
+                        if blob:
+                            _add_image_to_doc(doc, blob, getattr(value, "content_type", ""),
+                                              caption=getattr(value, "caption", "") or "")
+                    elif kind == "table" and value is not None:
+                        rows = getattr(value, "rows", None) or []
+                        if rows:
+                            _table(doc, rows)
+            elif not is_boilerplate:
+                for p_text in sec.get("paragraphs", []):
+                    if p_text.strip():
+                        _body(doc, p_text.strip())
+                for tbl_data in sec.get("tables", []):
+                    if isinstance(tbl_data, list) and tbl_data:
+                        _table(doc, tbl_data)
             if children:
                 _render_appendix_sections(
-                    doc, children, body_headings, image_map, level_prefix,
+                    doc, children, body_headings, image_map, counters,
                     apply_content_boundary=False,
                 )
             continue
 
         has_heading = bool(sec_heading)
         if has_heading:
-            level = len(level_prefix)
-            num_str = ".".join(str(x) for x in level_prefix)
-            # Strip source-document numbering from heading text:
-            #   "一、概述" → "概述",  "1、进入" → "进入",  "11.1 测定" → "测定"
+            # Use section's own level for counter depth, not tree position
+            counter_idx = section_level - 2  # L2→0, L3→1, L4→2
+            # Strip source-document numbering from heading text
             clean_sec_title = _STRIP_NUM('', sec_heading)
             clean_sec_title = _STRIP_CN_NUM('', clean_sec_title)
             clean_sec_title = _STRIP_SIMPLE_NUM('', clean_sec_title)
             clean_sec_title = clean_sec_title.strip()
             if not clean_sec_title:
                 clean_sec_title = sec_heading.strip()
-            # Depth-mapped heading: depth 1 → H2, depth 2 → H3, depth 3+ → H4
-            # so multi-level structure shows up correctly in Word's nav pane
-            if level >= 3:
-                _h4(doc, f"{num_str} {clean_sec_title}")
-            elif level == 2:
-                _h3(doc, f"{num_str} {clean_sec_title}")
+
+            if counter_idx < 0 or counter_idx >= 3:
+                # Preamble/cover (L<=1) or deep sub-steps (L>=5):
+                # render as bold body text, no heading number
+                p = doc.add_paragraph()
+                run = p.add_run(clean_sec_title)
+                run.bold = True
+                run.font.size = Pt(10.5)
+                run.font.name = "宋体"
+                run.font.color.rgb = BLACK
             else:
-                _h2(doc, f"{num_str} {clean_sec_title}")
+                # Ensure counter array is wide enough
+                while len(counters) <= counter_idx:
+                    counters.append(0)
+                counters[counter_idx] += 1
+                # Reset deeper counters
+                for i in range(counter_idx + 1, len(counters)):
+                    counters[i] = 0
+                num_str = ".".join(str(c) for c in counters[:counter_idx + 1])
+                if counter_idx == 0:
+                    _h2(doc, f"{num_str} {clean_sec_title}")
+                elif counter_idx == 1:
+                    _h3(doc, f"{num_str} {clean_sec_title}")
+                else:  # counter_idx == 2
+                    _h4(doc, f"{num_str} {clean_sec_title}")
 
         # Prefer ordered body (interleaved text/image/table), fall back to legacy fields
         body_items = sec.get("body", [])
@@ -592,19 +663,15 @@ def _render_appendix_sections(doc, sections: List[dict], body_headings: set,
                 if kind == "text" and value and str(value).strip():
                     _body(doc, str(value).strip())
                 elif kind == "image" and value is not None:
-                    # value is the original Image dataclass instance
                     blob = getattr(value, "blob", None)
                     if blob:
-                        caption = getattr(value, "caption", "") or ""
                         _add_image_to_doc(doc, blob, getattr(value, "content_type", ""),
-                                          caption=caption)
+                                          caption=getattr(value, "caption", "") or "")
                 elif kind == "table" and value is not None:
-                    # value is a Table dataclass with .rows attribute
                     rows = getattr(value, "rows", None) or []
                     if rows:
                         _table(doc, rows)
         else:
-            # Legacy fallback (body field wasn't populated): render fields separately
             for p_text in sec.get("paragraphs", []):
                 if p_text.strip():
                     _body(doc, p_text.strip())
@@ -618,14 +685,12 @@ def _render_appendix_sections(doc, sections: List[dict], body_headings: set,
 
         children = sec.get("children", [])
         if children:
-            child_prefix = level_prefix + [1]
+            # Share counters — children at deeper levels should continue
+            # from the parent's counter state
             _render_appendix_sections(
-                doc, children, body_headings, image_map, child_prefix,
+                doc, children, body_headings, image_map, counters,
                 apply_content_boundary=False,
             )
-
-        if has_heading:
-            level_prefix[-1] += 1
 
 
 # ====================================================================
@@ -919,7 +984,7 @@ def generate_merged_docx(merge_plan, docs_data,
                 if src_sections:
                     image_map = _build_image_map(all_images_by_doc, src_filename)
                     _render_appendix_sections(
-                        doc, src_sections, body_headings, image_map, [1],
+                        doc, src_sections, body_headings, image_map
                     )
                     continue
 
